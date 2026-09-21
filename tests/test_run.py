@@ -358,55 +358,44 @@ class CreatesOfARunThatDidNotFinish(RunTest):
 
         self.assertIn("local_%s.json" % X, self.names(self.box.a), "first contact again: a missing record is copied")
 
-    def test_a_failed_save_does_not_erase_what_was_already_known(self):
-        # X was under B before, was deleted there, and was then used under A, so it goes back to B.
-        # If writing that down fails, B's earlier presence must survive the undo.
-        import session_sync.run as module
-        write_record(self.box.a, X, activity=100)
-        self.sync()
-        (self.box.b / ("local_%s.json" % X)).unlink()
-        write_tombstone(self.box.b, X, deleted_at_ms=self.clock_s * 1000)
-        self.clock_s += 60
-        write_record(self.box.a, X, at_s=LONG_AGO_S + 50, activity=self.clock_s * 1000, title="used after the delete")
-        real = module.save_state
-        saves = []
-
-        def the_save_after_the_create_fails(path, stored):
-            saves.append(1)
-            if len(saves) == 1:
-                raise PermissionError("state.json")
-            real(path, stored)
-
-        with mock.patch.object(module, "save_state", the_save_after_the_create_fails):
-            self.sync()
-
-        self.assertNotIn("local_%s.json" % X, self.names(self.box.b))
-        self.assertIn(X, load_state(self.settings.state_path).sync.seen[str(self.box.b)])
-
-    def test_a_create_that_cannot_be_written_down_is_undone_and_tried_again_later(self):
+    def a_run_whose_save_after_the_create_fails(self, meanwhile=lambda: None):
         import session_sync.run as module
         write_record(self.box.a, Y)
         self.sync()
-        write_record(self.box.b, X)
+        write_record(self.box.b, X, title="as copied")
         real = module.save_state
         saves = []
 
         def the_save_after_the_create_fails(path, stored):
             saves.append(1)
             if len(saves) == 2:  # the first is what the run saw, the second follows the create
+                meanwhile()
                 raise PermissionError("state.json")
             real(path, stored)
 
         with mock.patch.object(module, "save_state", the_save_after_the_create_fails):
-            report = self.sync()
+            with self.assertRaises(RunAborted) as raised:
+                self.sync()
+        return str(raised.exception)
 
-        self.assertIn("PermissionError", report.failures[0].problem)
-        self.assertNotIn("local_%s.json" % X, self.names(self.box.a), "undone, so there is nothing to remember")
-        self.assertNotIn(X, load_state(self.settings.state_path).sync.seen[str(self.box.a)])
+    def test_a_create_that_cannot_be_written_down_stays_and_stops_the_run(self):
+        message = self.a_run_whose_save_after_the_create_fails()
+
+        self.assertIn(X, message)
+        self.assertIn("stays", message)
+        self.assertEqual(title_of(self.box.a, X), "as copied")
 
         self.sync()
-        self.assertIn("local_%s.json" % X, self.names(self.box.a))
+        self.assertIn(X, load_state(self.settings.state_path).sync.seen[str(self.box.a)], "the next run records it")
 
+    def test_what_the_app_wrote_over_a_new_record_during_a_failing_save_survives(self):
+        # The save hangs, the app logs in to that account and saves the session, then the save fails.
+        def the_app_replaces_the_record():
+            write_record(self.box.a, X, at_s=LONG_AGO_S + 99, activity=999, title="written by the app")
+
+        self.a_run_whose_save_after_the_create_fails(meanwhile=the_app_replaces_the_record)
+
+        self.assertEqual(title_of(self.box.a, X), "written by the app")
 
 class UntrustworthyTimes(RunTest):
     def test_activity_dated_in_the_future_decides_nothing(self):

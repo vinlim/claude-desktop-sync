@@ -115,41 +115,26 @@ class CreatingARecord(ApplierTest):
         self.assertEqual(recorded, [X], "the create was recorded before the stop signal took effect")
         self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
 
-    def test_a_create_that_cannot_be_recorded_is_undone(self):
-        # Presence that is not written down would let a later run put back a record the app removed.
+    def test_a_new_record_stays_whatever_goes_wrong_while_it_is_written_down(self):
+        # Removing it again would be a delete with no guard and no kept copy, and by then the app
+        # may have written over it.
         write_record(self.box.a, X)
         write_record(self.box.a, Y)
         scans = {str(p): scan_partition(p, {}, clock=lambda: NOW_NS) for p in (self.box.a, self.box.b)}
 
-        def recording_fails_for_x(partition, sid):
-            if sid == X:
-                raise PermissionError("state.json")
-
-        applier = Applier(scans, is_live=lambda partition: False, kept_dir=self.kept,
-                          on_created=recording_fails_for_x)
-
-        outcomes = applier.apply(Plan(actions=[CreateRecord(X, source=self.A, target=self.B),
-                                               CreateRecord(Y, source=self.A, target=self.B)]))
-
-        self.assertIn("PermissionError", outcomes[0].problem)
-        self.assertIsNone(outcomes[1].problem)
-        self.assertEqual(self.names(self.box.b), ["local_%s.json" % Y])
-
-    def test_a_create_that_can_neither_be_recorded_nor_undone_says_so(self):
-        import session_sync.applier as module
-        write_record(self.box.a, X)
-        scans = {str(p): scan_partition(p, {}, clock=lambda: NOW_NS) for p in (self.box.a, self.box.b)}
+        class CannotRecord(Exception):
+            pass
 
         def recording_fails(partition, sid):
-            raise PermissionError("state.json")
+            raise CannotRecord(sid)
 
         applier = Applier(scans, is_live=lambda partition: False, kept_dir=self.kept, on_created=recording_fails)
 
-        with mock.patch.object(module.os, "unlink", side_effect=PermissionError("cannot remove")):
-            outcomes = applier.apply(Plan(actions=[CreateRecord(X, source=self.A, target=self.B)]))
+        with self.assertRaises(CannotRecord):
+            applier.apply(Plan(actions=[CreateRecord(X, source=self.A, target=self.B),
+                                        CreateRecord(Y, source=self.A, target=self.B)]))
 
-        self.assertIn("could be neither recorded nor undone", outcomes[0].problem)
-
+        self.assertEqual(self.names(self.box.b), ["local_%s.json" % X], "X stays, and the run went no further")
 
 class ReplacingARecord(ApplierTest):
     def test_the_target_takes_the_sources_bytes(self):

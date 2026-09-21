@@ -31,9 +31,9 @@ class Applier:
         self.scans = scans
         self.is_live = is_live
         self.kept_dir = kept_dir
-        # Told (partition, session id) once a record exists, to write that down. If it raises,
-        # the create is undone: presence nobody recorded would let a later run put back a
-        # record the app removed (R7).
+        # Told (partition, session id) once a record exists, to write that down at once (R7).
+        # The record stays whatever this raises: removing it again would be a delete with no
+        # guard and no kept copy, and by then the app may have written over it (R8, R9).
         self.on_created = on_created
         self.handlers = {
             CreateRecord: self._create_record,
@@ -75,11 +75,7 @@ class Applier:
             raise Refused("a file appeared at the target since the scan")
         with _stop_signals_held_back():
             self._create(target, data, mtime_ns, "a file appeared at the target since the scan")
-            try:
-                self.on_created(action.target, action.session_id)
-            except BaseException as error:
-                self._undo_create(target, error)
-                raise
+            self.on_created(action.target, action.session_id)
 
     def _replace_record(self, action: ReplaceRecord) -> Optional[Path]:
         data, mtime_ns = self._read_planned_record(action.source, action.session_id)
@@ -136,15 +132,6 @@ class Applier:
                             self.scans[action.target].tombstones.get(action.session_id))
 
     # -- shared steps ----------------------------------------------------------
-
-    def _undo_create(self, target: Path, why: BaseException) -> None:
-        """The file is ours alone: it was linked a moment ago under a name that was free, and
-        the app has not had a login initialise since."""
-        try:
-            os.unlink(target)
-        except OSError as error:
-            raise Refused("the record was created but could be neither recorded nor undone (%s: %s, then %s: %s)"
-                          % (type(why).__name__, why, type(error).__name__, error))
 
     def _create(self, target: Path, data: bytes, mtime_ns: int, refusal: str) -> None:
         """Checks first so a standing refusal writes nothing: a watched directory would refire on it."""

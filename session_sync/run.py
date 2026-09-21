@@ -142,15 +142,14 @@ def _recorder(settings: Settings, stored: StoredState) -> Callable[[str, str], N
     """Writes a create down the moment it completes. One store holds what was ever in a partition,
     so nothing can disagree with it, and a run that stops afterwards has nothing left to recover."""
     def record(partition: str, session_id: str) -> None:
-        known = stored.sync.seen.setdefault(partition, set())
-        was_known = session_id in known
-        known.add(session_id)
+        stored.sync.seen.setdefault(partition, set()).add(session_id)
         try:
             save_state(settings.state_path, stored)
-        except BaseException:
-            if not was_known:
-                known.discard(session_id)  # the applier undoes the create, so there is nothing to remember
-            raise
+        except OSError as error:
+            # A tool that cannot write its state down must not go on writing records.
+            raise RunAborted("%s was created in %s, but the state could not be saved (%s: %s). The record stays "
+                             "where it is and the next run records it. Nothing further was changed."
+                             % (session_id, label(Path(partition)), type(error).__name__, error))
     return record
 
 

@@ -31,6 +31,37 @@ class StateStore(unittest.TestCase):
 
         self.assertEqual(load_state(self.path), stored)
 
+    def test_hashes_made_under_another_normalisation_are_dropped_and_the_rest_stays(self):
+        # A hash only compares with hashes made the same way. What was seen where is no hash.
+        stored = StoredState(
+            sync=SyncState(agreed={X: "h1"}, seen={"/p/a": {X, Y}}, placed={"/p/b": {Y: "h2"}}),
+            cache={"/p/a": {X: (12345678901234, 42, "h1", 99)}},
+            logins={"/data/Claude": ("aaaaaaaa-0000-4000-8000-000000000001", 777)},
+            reported="digest", last_success_ms=1234)
+        save_state(self.path, stored)
+        for written_under in ("some other normalisation", None):  # None: a file from before this was recorded
+            raw = json.loads(self.path.read_text())
+            if written_under is None:
+                del raw["normalisation"]
+            else:
+                raw["normalisation"] = written_under
+            self.path.write_text(json.dumps(raw))
+
+            loaded = load_state(self.path)
+
+            self.assertEqual((loaded.sync.agreed, loaded.sync.placed, loaded.cache), ({}, {}, {}))
+            self.assertEqual(loaded.sync.seen, {"/p/a": {X, Y}})
+            self.assertEqual((loaded.logins, loaded.reported, loaded.last_success_ms),
+                             (stored.logins, "digest", 1234))
+
+    def test_the_normalisation_is_named_by_what_it_leaves_out(self):
+        # Adding a volatile key must change the name with no second place to remember.
+        from session_sync import fingerprint as module
+        from unittest import mock
+        before = module.normalisation()
+        with mock.patch.object(module, "VOLATILE_KEYS", module.VOLATILE_KEYS + ("somethingNew",)):
+            self.assertNotEqual(module.normalisation(), before)
+
     def test_an_encoded_snapshot_shares_nothing_with_the_live_state(self):
         # A run compares the state with a snapshot taken at its start to decide whether to save.
         stored = StoredState(sync=SyncState(agreed={X: "h1"}, seen={"/p/a": {X}}, placed={"/p/b": {X: "h1"}}),

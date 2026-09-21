@@ -6,10 +6,17 @@ import math
 from session_sync.model import Copy
 
 # Top-level keys the app rewrites with no user action (DESIGN.md F6): lastFocusedAt on
-# every click, errorAt stamped afresh by each login for a side session that never started.
-VOLATILE_KEYS = ("lastFocusedAt", "errorAt")
+# every click, errorAt stamped afresh by each login for a side session that never started,
+# remoteMcpServersConfig replaced on every focus with the connectors of whoever is logged in.
+VOLATILE_KEYS = ("lastFocusedAt", "errorAt", "remoteMcpServersConfig")
 
 UNREADABLE = Copy(state_hash=None)
+
+
+def normalisation() -> str:
+    """Names how a hash is made. Hashes made under another name cannot be compared, so the
+    state file records this and drops its hashes when it changes."""
+    return "sha256 of sorted ASCII JSON, without " + ",".join(sorted(VOLATILE_KEYS))
 
 
 def fingerprint(session_id: str, data: bytes) -> Copy:

@@ -100,10 +100,12 @@ class Applier:
         scanned_sibling = scan.tmps.get(action.session_id)
         if scanned_sibling is None and os.path.lexists(sibling):
             raise Refused("a temp file appeared since the scan")
+        record, scanned_record = record_path(partition, action.session_id), scan.records.get(action.session_id)
+        # Before the temp file is touched: a refusal leaves no trace.
+        self._guard_existing(partition, record, scanned_record)
         # The temp file goes first: left behind alone, the app would promote it to a live record.
         kept = (self._retire(partition, sibling, scanned_sibling),) if scanned_sibling is not None else ()
-        return kept + (self._retire(partition, record_path(partition, action.session_id),
-                                    scan.records.get(action.session_id), absent_sibling=sibling),)
+        return kept + (self._retire(partition, record, scanned_record, absent_sibling=sibling),)
 
     def _retire_tmp(self, action: RetireTmp) -> Tuple[Path, ...]:
         partition = Path(action.target)

@@ -21,6 +21,21 @@ class Fingerprint(unittest.TestCase):
 
         self.assertEqual(before.state_hash, after.state_hash)
 
+    def test_the_connector_list_of_whoever_is_logged_in_is_not_state(self):
+        # F6: on every focus the app rewrites remoteMcpServersConfig from the current login's
+        # connectors, so with two accounts a plain click would read as a change.
+        under_one = fingerprint(SID, record(remoteMcpServersConfig=[{"uuid": "u1", "name": "one"},
+                                                                    {"uuid": "u2", "name": "two"}]))
+        under_other = fingerprint(SID, record(remoteMcpServersConfig=[{"uuid": "u9", "name": "nine"}]))
+        without = fingerprint(SID, record())
+
+        self.assertEqual(under_one.state_hash, under_other.state_hash)
+        self.assertEqual(under_one.state_hash, without.state_hash)
+
+    def test_which_tools_the_user_enabled_is_still_state(self):
+        self.assertNotEqual(fingerprint(SID, record(enabledMcpTools={"a": True})).state_hash,
+                            fingerprint(SID, record(enabledMcpTools={"a": False})).state_hash)
+
     def test_a_string_cut_through_an_emoji_is_still_a_readable_record(self):
         # The app truncates by UTF-16 code unit, so a record can hold half a surrogate pair.
         cut = b'{"sessionId": "local_%s", "lastTurnReport": "done \\ud83d", "lastActivityAt": 7}' % SID.encode()

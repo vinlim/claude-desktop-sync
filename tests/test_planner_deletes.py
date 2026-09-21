@@ -9,7 +9,7 @@ DELETED_AT = NOW - 1_000
 
 
 def planned(snapshots, sync_state=None, live=()):
-    return plan(snapshots, sync_state or state(), live=set(live), now_ms=NOW)
+    return plan(snapshots, sync_state or state(), live=set(live))
 
 
 class DeleteWins(unittest.TestCase):
@@ -39,9 +39,9 @@ class DeleteWins(unittest.TestCase):
         self.assertEqual(result.actions, [])
         self.assertEqual(result.problems, [Problem("live", X, "A")])
 
-    def test_a_tombstone_dated_in_the_future_is_read_as_now(self):
-        result = planned([snapshot("A", {X: copy("v1", activity=NOW - 1)}),
-                          snapshot("B", tombstones={X: NOW + 10 ** 9})])
+    def test_activity_in_the_same_millisecond_as_the_delete_is_not_after_it(self):
+        result = planned([snapshot("A", {X: copy("v1", activity=DELETED_AT)}),
+                          snapshot("B", tombstones={X: DELETED_AT})])
 
         self.assertEqual(result.actions[0], RetireRecord(X, target="A"))
 

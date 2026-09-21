@@ -90,7 +90,7 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None,
     scans = _scan(partitions, stored.cache, now_ns())
     app_is_running = running()
     live = {str(p) for p in partitions if is_live(p, app_is_running)}
-    the_plan = plan([scan.snapshot for scan in scans.values()], stored.sync, live, now_ns() // 1_000_000,
+    the_plan = plan([scan.snapshot for scan in scans.values()], stored.sync, live,
                     _resolve_prefer(prefer, partitions))
     report = RunReport(
         applied=apply,

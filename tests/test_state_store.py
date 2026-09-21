@@ -49,8 +49,12 @@ class StateStore(unittest.TestCase):
 
     def test_a_file_that_cannot_be_trusted_stops_the_run_and_says_how_to_recover(self):
         self.path.parent.mkdir(parents=True)
-        cases = {"torn": "{", "not an object": "[]", "from a newer version": json.dumps({"version": 999}),
-                 "wrong shape": json.dumps({"version": 1, "agreed": []})}
+        complete = {"version": 1, "agreed": {}, "deleted": [], "seen": {}, "placing": {}, "cache": {},
+                    "reported": "", "last_success_ms": 0}
+        cases = {"torn": "{", "not an object": "[]", "from a newer version": json.dumps(dict(complete, version=999)),
+                 "wrong shape": json.dumps(dict(complete, agreed=[]))}
+        self.path.write_text(json.dumps(complete))
+        load_state(self.path)  # the control: the complete shape itself is accepted
         for name, content in cases.items():
             with self.subTest(case=name):
                 self.path.write_text(content)

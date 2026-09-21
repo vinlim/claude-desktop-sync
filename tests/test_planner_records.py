@@ -2,11 +2,11 @@ import unittest
 
 from session_sync.model import CreateRecord, Problem, ReplaceRecord
 from session_sync.planner import plan
-from tests.helpers import NOW, X, copy, snapshot, state
+from tests.helpers import X, copy, snapshot, state
 
 
 def planned(snapshots, sync_state=None, live=(), prefer=None):
-    return plan(snapshots, sync_state or state(), live=set(live), now_ms=NOW, prefer=prefer)
+    return plan(snapshots, sync_state or state(), live=set(live), prefer=prefer)
 
 
 class NewRecords(unittest.TestCase):

@@ -9,18 +9,17 @@ from session_sync.model import (CreateRecord, CreateTombstone, Plan, Problem, Re
                                 RetireTombstone, Snapshot, SyncState)
 
 
-def plan(snapshots: List[Snapshot], state: SyncState, live: Set[str], now_ms: int,
-         prefer: Optional[str] = None) -> Plan:
+def plan(snapshots: List[Snapshot], state: SyncState, live: Set[str], prefer: Optional[str] = None) -> Plan:
     result = Plan()
     session_ids = set()
     for snapshot in snapshots:
         session_ids.update(snapshot.records, snapshot.tombstones, snapshot.orphan_tmps)
     for session_id in sorted(session_ids):
-        _plan_session(session_id, snapshots, state, live, now_ms, prefer, result)
+        _plan_session(session_id, snapshots, state, live, prefer, result)
     return result
 
 
-def _plan_session(session_id: str, snapshots: List[Snapshot], state: SyncState, live: Set[str], now_ms: int,
+def _plan_session(session_id: str, snapshots: List[Snapshot], state: SyncState, live: Set[str],
                   prefer: Optional[str], result: Plan) -> None:
     holders = [s for s in snapshots if session_id in s.records]
     unreadable = [s for s in holders if not s.records[session_id].readable]
@@ -34,7 +33,7 @@ def _plan_session(session_id: str, snapshots: List[Snapshot], state: SyncState, 
             _plan_record(session_id, snapshots, holders, state, live, prefer, result, absence_explained=False)
         return
 
-    if holders and _record_outlives_delete(session_id, holders, entombed, state, now_ms):
+    if holders and _record_outlives_delete(session_id, holders, entombed, state):
         _plan_record(session_id, snapshots, holders, state, live, prefer, result, absence_explained=True)
         for snapshot in entombed:
             _unless_live(snapshot, session_id, live, result, RetireTombstone(session_id, target=snapshot.key))
@@ -43,12 +42,12 @@ def _plan_session(session_id: str, snapshots: List[Snapshot], state: SyncState, 
     _plan_delete(session_id, snapshots, entombed[0], live, result)
 
 
-def _record_outlives_delete(session_id: str, holders: List[Snapshot], entombed: List[Snapshot], state: SyncState,
-                            now_ms: int) -> bool:
+def _record_outlives_delete(session_id: str, holders: List[Snapshot], entombed: List[Snapshot],
+                            state: SyncState) -> bool:
     """R6. A finished delete followed by a record is a re-creation, whatever its timestamps say."""
     if session_id in state.deleted:
         return True
-    deleted_at = min(max(s.tombstones[session_id] for s in entombed), now_ms)
+    deleted_at = max(s.tombstones[session_id] for s in entombed)
     return max(s.records[session_id].last_activity_at for s in holders) > deleted_at
 
 

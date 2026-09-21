@@ -72,6 +72,20 @@ class CreatingARecord(ApplierTest):
         self.assertIn("source changed", outcomes[0].problem)
         self.assertEqual(self.names(self.box.b), [])
 
+    def test_bytes_that_are_not_the_version_the_planner_chose_are_not_copied(self):
+        # A cache entry can match a file's time and size and still describe other bytes.
+        path = write_record(self.box.a, X, title="what is really on disk")
+        info = os.lstat(path)
+        poisoned = {X: (info.st_mtime_ns, info.st_size, "hash-of-some-other-version", 100)}
+        scans = {self.A: scan_partition(self.box.a, poisoned, now_ns=NOW_NS),
+                 self.B: scan_partition(self.box.b, {}, now_ns=NOW_NS)}
+        applier = Applier(scans, is_live=lambda partition: False, kept_dir=self.kept)
+
+        outcomes = applier.apply(Plan(actions=[CreateRecord(X, source=self.A, target=self.B)]))
+
+        self.assertIn("source changed", outcomes[0].problem)
+        self.assertEqual(self.names(self.box.b), [])
+
 
 class ReplacingARecord(ApplierTest):
     def test_the_target_takes_the_sources_bytes(self):

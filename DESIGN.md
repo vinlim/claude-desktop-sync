@@ -45,7 +45,7 @@ Verified against desktop app 2.2553.1 (main-process JavaScript) on 2026-09-21. R
 
 **R5 New records.** An id missing from a partition is created there unless R7 forbids it. Creation is allowed in a live partition, because the app cannot hold what it has never loaded.
 
-**R6 Deletes.** For an id with a tombstone anywhere and a record anywhere, let T be the newest tombstone time, clamped to now.
+**R6 Deletes.** For an id with a tombstone anywhere and a record anywhere, let T be the newest tombstone time. The scanner never reports a time in the future: it falls back to the tombstone file's own time, clamped to now.
 - If `deleted` is true the record is a re-creation (F10): the record wins.
 - Else if some copy has `lastActivityAt` greater than T the session was used after the delete: the record wins.
 - Else the delete wins.

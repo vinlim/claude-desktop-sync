@@ -33,7 +33,7 @@ def _plan_session(session_id: str, snapshots: List[Snapshot], state: SyncState, 
             _plan_record(session_id, snapshots, holders, state, live, prefer, result, absence_explained=False)
         return
 
-    if holders and _record_outlives_delete(session_id, holders, entombed, state):
+    if holders and _used_after_delete(session_id, holders, entombed):
         _plan_record(session_id, snapshots, holders, state, live, prefer, result, absence_explained=True)
         for snapshot in entombed:
             _unless_live(snapshot, session_id, live, result, RetireTombstone(session_id, target=snapshot.key))
@@ -42,11 +42,8 @@ def _plan_session(session_id: str, snapshots: List[Snapshot], state: SyncState, 
     _plan_delete(session_id, snapshots, entombed[0], live, result)
 
 
-def _record_outlives_delete(session_id: str, holders: List[Snapshot], entombed: List[Snapshot],
-                            state: SyncState) -> bool:
-    """R6. A finished delete followed by a record is a re-creation, whatever its timestamps say."""
-    if session_id in state.deleted:
-        return True
+def _used_after_delete(session_id: str, holders: List[Snapshot], entombed: List[Snapshot]) -> bool:
+    """R6. Time alone decides: the app stamps a re-adopted session with the current time (F10)."""
     deleted_at = max(s.tombstones[session_id] for s in entombed)
     return max(s.records[session_id].last_activity_at for s in holders) > deleted_at
 
@@ -75,18 +72,20 @@ def _unless_live(snapshot: Snapshot, session_id: str, live: Set[str], result: Pl
 
 def _plan_record(session_id: str, snapshots: List[Snapshot], holders: List[Snapshot], state: SyncState,
                  live: Set[str], prefer: Optional[str], result: Plan, absence_explained: bool) -> None:
-    agreed = state.agreed.get(session_id)
-    winner = _one_sided_winner(session_id, holders, agreed) or _latest_activity_winner(session_id, holders, prefer)
+    untouched = [s for s in holders if _still_as_synced(s, session_id, state)]
+    winner = _one_sided_winner(session_id, holders, untouched) or _latest_activity_winner(session_id, holders, prefer)
     if winner is None:  # R4: a tie nobody settled
         result.problems.extend(Problem("tied", session_id, s.key) for s in _most_active(session_id, holders))
         return
 
-    winning_hash = winner.records[session_id].state_hash
+    winning = winner.records[session_id]
     for target in holders:
-        held = target.records[session_id].state_hash
-        if held != winning_hash:
+        held = target.records[session_id]
+        if held.state_hash != winning.state_hash:
+            # R8: only a copy still as synced, and strictly behind in activity, holds nothing unique.
+            superseded = target in untouched and winning.last_activity_at > held.last_activity_at
             _unless_live(target, session_id, live, result,
-                         ReplaceRecord(session_id, source=winner.key, target=target.key, keep=held != agreed))
+                         ReplaceRecord(session_id, source=winner.key, target=target.key, keep=not superseded))
 
     for target in snapshots:
         if session_id in target.records:
@@ -97,15 +96,28 @@ def _plan_record(session_id: str, snapshots: List[Snapshot], holders: List[Snaps
         result.actions.append(CreateRecord(session_id, source=winner.key, target=target.key))  # R5
 
 
-def _one_sided_winner(session_id: str, holders: List[Snapshot], agreed: Optional[str]) -> Optional[Snapshot]:
-    """R3: every copy that left the agreed state left it for the same new state."""
-    hashes = {s.records[session_id].state_hash for s in holders}
-    if len(hashes) == 1:
+def _still_as_synced(snapshot: Snapshot, session_id: str, state: SyncState) -> bool:
+    """The copy is the agreed state, or a version the tool itself placed there and the app has not touched."""
+    held = snapshot.records[session_id].state_hash
+    return held == state.agreed.get(session_id) or held == state.placed.get(snapshot.key, {}).get(session_id)
+
+
+def _one_sided_winner(session_id: str, holders: List[Snapshot], untouched: List[Snapshot]) -> Optional[Snapshot]:
+    """R3: every copy that moved on moved to the same new state, and that state is not behind.
+
+    A copy can also leave the synced state by going back in time (a restored backup, a
+    promoted temp file, a login flushing stale memory). Its activity is then lower than
+    what it would replace, and the case falls through to R4.
+    """
+    if len({s.records[session_id].state_hash for s in holders}) == 1:
         return holders[0]
-    changed = [s for s in holders if s.records[session_id].state_hash != agreed]
-    if agreed is not None and len({s.records[session_id].state_hash for s in changed}) == 1:
-        return changed[0]
-    return None
+    changed = [s for s in holders if s not in untouched]
+    if not untouched or len({s.records[session_id].state_hash for s in changed}) != 1:
+        return None
+    candidate = changed[0]
+    behind = any(candidate.records[session_id].last_activity_at < s.records[session_id].last_activity_at
+                 for s in untouched)
+    return None if behind else candidate
 
 
 def _most_active(session_id: str, holders: List[Snapshot]) -> List[Snapshot]:

@@ -30,9 +30,9 @@ class SyncState:
     """What the tool remembers between runs (DESIGN.md, Model)."""
 
     agreed: Dict[str, str] = field(default_factory=dict)
-    deleted: Set[str] = field(default_factory=set)
     seen: Dict[str, Set[str]] = field(default_factory=dict)
     placing: Dict[str, Set[str]] = field(default_factory=dict)
+    placed: Dict[str, Dict[str, str]] = field(default_factory=dict)  # partition -> id -> hash the tool put there
 
 
 @dataclass(frozen=True)

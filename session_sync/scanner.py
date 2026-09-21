@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from session_sync.fingerprint import fingerprint
+from session_sync.fingerprint import UNREADABLE, fingerprint
 from session_sync.model import Copy, Snapshot
 
 # The app's own filters: a name that starts with local_ and ends with .json, or starts with deleted_.
@@ -91,11 +91,18 @@ def _read_record(path: Path, session_id: str, stamp: Stamp, cache: Dict[str, Cac
     cached = cache.get(session_id)
     settled = now_ns - stamp[0] >= RACY_WINDOW_NS
     if cached is not None and settled and (cached[0], cached[1]) == stamp:
-        return Copy(state_hash=cached[2], last_activity_at=cached[3])
-    try:
-        return fingerprint(session_id, path.read_bytes())
-    except OSError:
-        return None
+        copy = Copy(state_hash=cached[2], last_activity_at=cached[3])
+    else:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        try:
+            copy = fingerprint(session_id, data)
+        except Exception:  # one odd record must never stop the run: it is unreadable (R11)
+            copy = UNREADABLE
+    # Activity in the future would outrank every tombstone, and the session could never be deleted.
+    return Copy(copy.state_hash, min(copy.last_activity_at, now_ns // 1_000_000))
 
 
 def _read_delete_time(path: Path, now_ms: int) -> Optional[int]:

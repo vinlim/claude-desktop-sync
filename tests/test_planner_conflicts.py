@@ -76,6 +76,27 @@ class BothSidesChanged(unittest.TestCase):
         self.assertEqual(result.actions, [ReplaceRecord(X, source="A", target="C", keep=True)])
 
 
+class TheToolsOwnPlacements(unittest.TestCase):
+    """R3 with three partitions: a copy the tool placed is not a change."""
+
+    def test_a_second_change_after_partial_propagation_is_still_one_sided(self):
+        # C was live, so A's first change reached B only and the agreed state could not move.
+        result = planned([snapshot("A", {X: copy("second", activity=5)}),
+                          snapshot("B", {X: copy("first", activity=5)}),
+                          snapshot("C", {X: copy("v0", activity=5)})],
+                         state(agreed={X: "v0"}, placed={"B": {X: "first"}}), live={"C"})
+
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="A", target="B", keep=True)])
+        self.assertEqual(result.problems, [Problem("live", X, "C")])
+
+    def test_a_placed_copy_the_app_has_since_changed_counts_as_changed(self):
+        result = planned([snapshot("A", {X: copy("second", activity=5)}),
+                          snapshot("B", {X: copy("edited under B", activity=5)})],
+                         state(agreed={X: "v0"}, placed={"B": {X: "first"}}))
+
+        self.assertEqual({p.kind for p in result.problems}, {"tied"})
+
+
 class UnreadableCopies(unittest.TestCase):
     """R11."""
 

@@ -33,10 +33,25 @@ class OneSideChanged(unittest.TestCase):
     """R3."""
 
     def test_the_changed_side_replaces_the_side_still_at_the_agreed_state(self):
-        result = planned([snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v2")})],
+        result = planned([snapshot("A", {X: copy("v1", activity=10)}), snapshot("B", {X: copy("v2", activity=50)})],
                          state(agreed={X: "v1"}))
 
         self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=False)])
+
+    def test_a_change_without_new_activity_still_wins_but_the_replaced_copy_is_kept(self):
+        # A rename or an archive moves no activity. It cannot be told from a copy that
+        # went back to an older state, so what it replaces is never thrown away.
+        result = planned([snapshot("A", {X: copy("v1", activity=50)}), snapshot("B", {X: copy("renamed", activity=50)})],
+                         state(agreed={X: "v1"}))
+
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=True)])
+
+    def test_a_copy_that_went_back_to_an_older_state_never_wins_and_is_itself_kept(self):
+        # A restored backup, a promoted temp file, or a login flushing stale memory.
+        result = planned([snapshot("A", {X: copy("older", activity=10)}), snapshot("B", {X: copy("v2", activity=50)})],
+                         state(agreed={X: "v2"}))
+
+        self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=True)])
 
     def test_mtime_plays_no_part_so_a_clicked_stale_copy_never_wins(self):
         # The reviewer's B1: work under B, then only click X under A. A click
@@ -48,15 +63,15 @@ class OneSideChanged(unittest.TestCase):
         self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=False)])
 
     def test_a_live_partition_is_never_overwritten(self):
-        result = planned([snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v2")})],
+        result = planned([snapshot("A", {X: copy("v1", activity=10)}), snapshot("B", {X: copy("v2", activity=50)})],
                          state(agreed={X: "v1"}), live={"A"})
 
         self.assertEqual(result.actions, [])
         self.assertEqual(result.problems, [Problem("live", X, "A")])
 
     def test_with_three_partitions_every_unchanged_copy_is_replaced(self):
-        result = planned([snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v2")}),
-                          snapshot("C", {X: copy("v1")})], state(agreed={X: "v1"}))
+        result = planned([snapshot("A", {X: copy("v1", activity=10)}), snapshot("B", {X: copy("v2", activity=50)}),
+                          snapshot("C", {X: copy("v1", activity=10)})], state(agreed={X: "v1"}))
 
         self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=False),
                                           ReplaceRecord(X, source="B", target="C", keep=False)])

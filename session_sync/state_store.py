@@ -47,9 +47,9 @@ def _encode(stored: StoredState) -> dict:
     return {
         "version": VERSION,
         "agreed": sync.agreed,
-        "deleted": sorted(sync.deleted),
         "seen": {key: sorted(ids) for key, ids in sync.seen.items()},
         "placing": {key: sorted(ids) for key, ids in sync.placing.items()},
+        "placed": sync.placed,
         "cache": {key: {sid: list(entry) for sid, entry in entries.items()} for key, entries in stored.cache.items()},
         "reported": stored.reported,
         "last_success_ms": stored.last_success_ms,
@@ -63,9 +63,10 @@ def _decode(raw: dict) -> StoredState:
         raise ValueError("written by format version %r, this tool reads %d" % (raw.get("version"), VERSION))
     sync = SyncState(
         agreed={str(sid): str(value) for sid, value in raw["agreed"].items()},
-        deleted=set(raw["deleted"]),
         seen={key: set(ids) for key, ids in raw["seen"].items()},
-        placing={key: set(ids) for key, ids in raw["placing"].items()})
+        placing={key: set(ids) for key, ids in raw["placing"].items()},
+        placed={key: {str(sid): str(value) for sid, value in entries.items()}
+                for key, entries in raw["placed"].items()})
     cache = {key: {sid: (int(e[0]), int(e[1]), e[2], int(e[3])) for sid, e in entries.items()}
              for key, entries in raw["cache"].items()}
     return StoredState(sync=sync, cache=cache, reported=str(raw["reported"]),

@@ -19,7 +19,8 @@ def snapshot(key, records=None, tombstones=None, orphan_tmps=()):
                     orphan_tmps=frozenset(orphan_tmps))
 
 
-def state(agreed=None, deleted=(), seen=None, placing=None):
-    return SyncState(agreed=dict(agreed or {}), deleted=set(deleted),
+def state(agreed=None, seen=None, placing=None, placed=None):
+    return SyncState(agreed=dict(agreed or {}),
                      seen={k: set(v) for k, v in (seen or {}).items()},
-                     placing={k: set(v) for k, v in (placing or {}).items()})
+                     placing={k: set(v) for k, v in (placing or {}).items()},
+                     placed={k: dict(v) for k, v in (placed or {}).items()})

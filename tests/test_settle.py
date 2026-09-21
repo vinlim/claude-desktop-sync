@@ -34,27 +34,41 @@ class Agreement(unittest.TestCase):
 
 
 class FinishedDeletes(unittest.TestCase):
-    def test_a_tombstone_everywhere_and_a_record_nowhere_is_a_finished_delete(self):
+    def test_a_finished_delete_is_forgotten_so_a_later_re_adoption_does_not_look_lost(self):
         after = settle(state(agreed={X: "v1"}, seen={"A": {X}, "B": {X}}),
                        [snapshot("A", tombstones={X: NOW}), snapshot("B", tombstones={X: NOW})])
 
-        self.assertEqual(after.deleted, {X})
         self.assertEqual(after.agreed, {})
-        self.assertEqual(after.seen, {"A": set(), "B": set()},
-                         "a finished delete must not make a later re-creation look lost")
+        self.assertEqual(after.seen, {"A": set(), "B": set()})
 
-    def test_a_delete_that_has_not_reached_every_partition_is_not_finished(self):
-        after = settle(state(), [snapshot("A", {X: copy("v1")}), snapshot("B", tombstones={X: NOW})])
+    def test_a_delete_still_on_its_way_keeps_what_is_known(self):
+        after = settle(state(agreed={X: "v1"}, seen={"A": {X}, "B": {X}}),
+                       [snapshot("A", {X: copy("v1")}), snapshot("B", tombstones={X: NOW})])
 
-        self.assertEqual(after.deleted, set())
+        self.assertEqual(after.agreed, {X: "v1"})
+        self.assertEqual(after.seen, {"A": {X}, "B": {X}})
 
-    def test_a_re_creation_is_complete_only_when_no_tombstone_remains(self):
-        everywhere = [snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v1")}, tombstones={X: NOW})]
-        cleared = [snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v1")})]
 
-        self.assertEqual(settle(state(deleted={X}), everywhere).deleted, {X},
-                         "with a stale tombstone left, forgetting the delete would retire the new record next run")
-        self.assertEqual(settle(state(deleted={X}), cleared).deleted, set())
+class RememberedPlacements(unittest.TestCase):
+    """R3: a version the tool placed counts as unchanged only while it is still exactly that."""
+
+    def test_a_placement_waiting_for_the_rest_to_catch_up_is_remembered(self):
+        after = settle(state(agreed={X: "v0"}, placed={"B": {X: "v1"}}),
+                       [snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v1")}), snapshot("C", {X: copy("v0")})])
+
+        self.assertEqual(after.placed, {"B": {X: "v1"}})
+
+    def test_a_placement_is_forgotten_once_it_is_no_longer_needed_or_no_longer_true(self):
+        cases = {
+            "everyone agrees now": [snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("v1")})],
+            "the app changed the copy": [snapshot("A", {X: copy("v1")}), snapshot("B", {X: copy("edited")})],
+            "the copy is gone": [snapshot("A", {X: copy("v1")}), snapshot("B")],
+        }
+        for name, snapshots in cases.items():
+            with self.subTest(case=name):
+                after = settle(state(agreed={X: "v0"}, placed={"B": {X: "v1"}}), snapshots)
+
+                self.assertEqual(after.placed, {})
 
 
 class Presence(unittest.TestCase):

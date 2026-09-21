@@ -75,14 +75,13 @@ class RecordWins(unittest.TestCase):
                                           RetireTombstone(X, target="B")])
         self.assertEqual(result.problems, [], "a tombstone explains the absence, so this is not a lost record")
 
-    def test_a_record_that_reappears_after_a_finished_delete_is_a_re_creation(self):
-        # F10: the app removed its own tombstone and re-imported the transcript.
-        # Every timestamp in the new record can predate the old tombstone.
-        result = planned([snapshot("A", {X: copy("v1", activity=DELETED_AT - 500)}),
-                          snapshot("B", tombstones={X: DELETED_AT})], state(deleted={X}))
+    def test_a_stale_copy_in_a_newly_enrolled_partition_does_not_undo_a_finished_delete(self):
+        # Only time decides. A re-adopted session is stamped with the current time (F10),
+        # so nothing has to remember that a delete finished, and nothing can remember it wrongly.
+        result = planned([snapshot("A", tombstones={X: DELETED_AT}), snapshot("B", tombstones={X: DELETED_AT}),
+                          snapshot("C", {X: copy("v1", activity=DELETED_AT - 500)})])
 
-        self.assertEqual(result.actions, [CreateRecord(X, source="A", target="B"),
-                                          RetireTombstone(X, target="B")])
+        self.assertEqual(result.actions, [RetireRecord(X, target="C"), CreateTombstone(X, source="A", target="C")])
 
     def test_a_stale_tombstone_in_a_live_partition_waits(self):
         result = planned([snapshot("A", {X: copy("v2", activity=DELETED_AT + 5)}),

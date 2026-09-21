@@ -105,7 +105,9 @@ class ReviewerScenarios(RunTest):
         self.assertEqual(self.names(self.box.a), ["deleted_%s" % X])
         self.assertEqual(self.names(self.box.b), ["deleted_%s" % X])
         self.assertEqual(self.kept(), ["local_%s.json" % X])
-        self.assertIn(X, load_state(self.settings.state_path).sync.deleted)
+        remembered = load_state(self.settings.state_path).sync
+        self.assertNotIn(X, remembered.agreed)
+        self.assertEqual(remembered.seen, {str(self.box.a): set(), str(self.box.b): set()})
 
     def test_p6_a_record_removed_before_its_tombstone_is_written_is_not_put_back(self):
         self.synced()
@@ -122,20 +124,60 @@ class ReviewerScenarios(RunTest):
         self.sync()
         self.assertEqual(self.names(self.box.a), ["deleted_%s" % X])
 
-    def test_a_re_imported_session_survives_the_old_tombstone(self):
+    def finished_delete(self):
         self.synced()
         for side in (self.box.a, self.box.b):
             (side / ("local_%s.json" % X)).unlink()
             write_tombstone(side, X, deleted_at_ms=NOW_MS)
         self.sync()
+
+    def re_adopt_under_a(self, at_ms):
+        """What the app does (F10): drop its own tombstone, stamp the new record with the current time."""
         (self.box.a / ("deleted_%s" % X)).unlink()
-        write_record(self.box.a, X, activity=50, title="re-imported, with old timestamps")
+        write_record(self.box.a, X, activity=at_ms, title="re-adopted")
+        self.clock_s = max(self.clock_s, at_ms // 1000)
+
+    def test_a_re_adopted_session_survives_the_old_tombstone(self):
+        self.finished_delete()
+        self.re_adopt_under_a(at_ms=NOW_MS + 60_000)
 
         self.sync()
 
         self.assertEqual(self.names(self.box.a), ["local_%s.json" % X])
         self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
         self.assertTrue(self.in_sync())
+
+    def test_a_session_deleted_again_after_re_adoption_stays_deleted(self):
+        # Re-adopted under A, then deleted under B before any run saw the re-adoption.
+        self.finished_delete()
+        self.re_adopt_under_a(at_ms=NOW_MS + 60_000)
+        write_tombstone(self.box.b, X, deleted_at_ms=NOW_MS + 120_000)
+        self.clock_s = NOW_S + 300
+
+        self.sync()
+
+        self.assertEqual(self.names(self.box.a), ["deleted_%s" % X])
+        self.assertEqual(self.names(self.box.b), ["deleted_%s" % X])
+
+    def test_a_third_partition_with_a_stale_copy_does_not_undo_a_finished_delete(self):
+        self.finished_delete()
+        third = self.box.partition("cccccccc-0000-4000-8000-000000000003", "cccccccc-0000-4000-8000-0000000000c3")
+        write_record(third, X, activity=100, title="stale")
+        enrol(self.settings.config_path, third)
+
+        self.sync()
+
+        self.assertEqual(self.names(third), ["deleted_%s" % X])
+        self.assertEqual(self.names(self.box.a), ["deleted_%s" % X])
+
+    def test_forgetting_the_sync_history_does_not_bring_a_deleted_session_back_or_retire_a_live_one(self):
+        self.finished_delete()
+        self.re_adopt_under_a(at_ms=NOW_MS + 60_000)
+        self.settings.state_path.unlink()
+
+        self.sync()
+
+        self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
 
     def test_prefer_settles_a_tie(self):
         self.synced()

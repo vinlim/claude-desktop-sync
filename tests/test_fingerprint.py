@@ -13,13 +13,22 @@ def record(**fields):
 
 
 class Fingerprint(unittest.TestCase):
-    def test_a_click_does_not_change_the_state(self):
-        # F6: making a session visible rewrites lastFocusedAt, and a save after a
-        # relaunch carries processGoneReason. Neither is user state.
-        before = fingerprint(SID, record())
-        after = fingerprint(SID, record(lastFocusedAt=999, processGoneReason="app_relaunch"))
+    def test_what_the_app_rewrites_with_no_user_action_is_not_state(self):
+        # F6: making a session visible rewrites lastFocusedAt. At load each login stamps
+        # its own errorAt on a side session that never started, which would read as a tie.
+        before = fingerprint(SID, record(error="never started", errorAt=111))
+        after = fingerprint(SID, record(error="never started", errorAt=222, lastFocusedAt=999))
 
         self.assertEqual(before.state_hash, after.state_hash)
+
+    def test_a_string_cut_through_an_emoji_is_still_a_readable_record(self):
+        # The app truncates by UTF-16 code unit, so a record can hold half a surrogate pair.
+        cut = b'{"sessionId": "local_%s", "lastTurnReport": "done \\ud83d", "lastActivityAt": 7}' % SID.encode()
+        whole = b'{"sessionId": "local_%s", "lastTurnReport": "done", "lastActivityAt": 7}' % SID.encode()
+
+        self.assertTrue(fingerprint(SID, cut).readable)
+        self.assertEqual(fingerprint(SID, cut).last_activity_at, 7)
+        self.assertNotEqual(fingerprint(SID, cut).state_hash, fingerprint(SID, whole).state_hash)
 
     def test_key_order_and_spacing_do_not_change_the_state(self):
         one = fingerprint(SID, b'{"sessionId":"local_%s","title":"t"}' % SID.encode())
@@ -41,8 +50,11 @@ class Fingerprint(unittest.TestCase):
     def test_activity_is_read_from_the_record(self):
         self.assertEqual(fingerprint(SID, record(lastActivityAt=1234)).last_activity_at, 1234)
 
+    def test_a_whole_number_written_as_a_float_is_still_a_time(self):
+        self.assertEqual(fingerprint(SID, record(lastActivityAt=1234.0)).last_activity_at, 1234)
+
     def test_missing_or_odd_activity_reads_as_zero(self):
-        for value in (None, "soon", True, 1.5, -3):
+        for value in (None, "soon", True, 1.5, -3, float("inf")):
             with self.subTest(value=value):
                 self.assertEqual(fingerprint(SID, record(lastActivityAt=value)).last_activity_at, 0)
 

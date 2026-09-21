@@ -124,6 +124,36 @@ class Robustness(unittest.TestCase):
         self.assertEqual(result.snapshot.tombstones, {})
 
 
+class OddRecords(unittest.TestCase):
+    def setUp(self):
+        self.box = Sandbox()
+        self.addCleanup(self.box.cleanup)
+
+    def test_a_record_the_fingerprint_chokes_on_is_unreadable_and_the_scan_goes_on(self):
+        write_record(self.box.a, X)
+        write_record(self.box.a, Y)
+        real = fingerprint
+
+        def choking(session_id, data):
+            if session_id == X:
+                raise RuntimeError("something nobody predicted")
+            return real(session_id, data)
+
+        with mock.patch("session_sync.scanner.fingerprint", choking):
+            result = scan(self.box.a)
+
+        self.assertFalse(result.snapshot.records[X].readable)
+        self.assertTrue(result.snapshot.records[Y].readable)
+
+    def test_activity_dated_in_the_future_is_read_as_now(self):
+        # Otherwise such a record would outrank every tombstone and could never be deleted.
+        write_record(self.box.a, X, activity=NOW_MS + 10 ** 9)
+        first = scan(self.box.a)
+
+        self.assertEqual(first.snapshot.records[X].last_activity_at, NOW_MS)
+        self.assertEqual(scan(self.box.a, cache=first.cache).snapshot.records[X].last_activity_at, NOW_MS)
+
+
 class Cache(unittest.TestCase):
     def setUp(self):
         self.box = Sandbox()

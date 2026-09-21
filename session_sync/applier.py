@@ -1,6 +1,8 @@
 """Carries out a plan on disk. Every change to an existing file passes the R9 guards
 at the moment it happens, and nothing unique is removed without a kept copy (R8)."""
+import contextlib
 import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -25,11 +27,14 @@ class Refused(Exception):
 
 class Applier:
     def __init__(self, scans: Dict[str, PartitionScan], is_live: Callable[[Path], bool], kept_dir: Path,
-                 before_create: Callable[[str, str], None] = lambda partition, session_id: None) -> None:
+                 before_create: Callable[[str, str], None] = lambda partition, session_id: None,
+                 after_create: Callable[[str, str], None] = lambda partition, session_id: None) -> None:
         self.scans = scans
         self.is_live = is_live
         self.kept_dir = kept_dir
-        self.before_create = before_create  # told (partition, session id) just before a record is created
+        # Both are told (partition, session id): one just before a record is created, one once it exists.
+        self.before_create = before_create
+        self.after_create = after_create
         self.handlers = {
             CreateRecord: self._create_record,
             ReplaceRecord: self._replace_record,
@@ -69,7 +74,9 @@ class Applier:
         if os.path.lexists(target):
             raise Refused("a file appeared at the target since the scan")
         self.before_create(action.target, action.session_id)
-        self._create(target, data, mtime_ns, "a file appeared at the target since the scan")
+        with _stop_signals_held_back():
+            self._create(target, data, mtime_ns, "a file appeared at the target since the scan")
+            self.after_create(action.target, action.session_id)
 
     def _replace_record(self, action: ReplaceRecord) -> Optional[Path]:
         data, mtime_ns = self._read_planned_record(action.source, action.session_id)
@@ -181,6 +188,17 @@ class Applier:
             raise Refused("a temp file appeared during the retirement")
         os.unlink(path)
         return kept
+
+
+@contextlib.contextmanager
+def _stop_signals_held_back():
+    """A create and the journal line that proves it belong together. A stop signal that landed
+    between the two would leave a completed create looking as if it may never have happened."""
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
 
 
 def _unused_name(path: Path) -> Path:

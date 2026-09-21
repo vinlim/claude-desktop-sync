@@ -112,6 +112,21 @@ class Robustness(unittest.TestCase):
 
         self.assertEqual(set(result.snapshot.records), {Y})
 
+    def test_an_entry_that_cannot_be_inspected_is_an_error_not_an_absence(self):
+        # A transient I/O error on one entry. Skipping it would make the partition look as if it
+        # never held the record.
+        write_record(self.box.a, X)
+        with mock.patch("session_sync.scanner.os.lstat", side_effect=OSError(5, "Input/output error")):
+            with self.assertRaises(OSError):
+                scan(self.box.a)
+
+    def test_a_tombstone_whose_own_time_cannot_be_read_is_an_error_too(self):
+        tombstone = write_tombstone(self.box.a, X, 0, content="garbage")
+        listed = os.lstat(tombstone)
+        with mock.patch("session_sync.scanner.os.lstat", side_effect=[listed, OSError(5, "Input/output error")]):
+            with self.assertRaises(OSError):
+                scan(self.box.a)
+
     def test_a_tombstone_that_vanishes_while_being_read_is_skipped(self):
         # The app removes a tombstone when a session is re-adopted.
         tombstone = write_tombstone(self.box.a, X, 5)

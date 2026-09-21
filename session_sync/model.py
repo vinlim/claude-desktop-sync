@@ -86,7 +86,7 @@ Action = Union[CreateRecord, ReplaceRecord, RetireRecord, RetireTmp, CreateTombs
 
 @dataclass(frozen=True)
 class Problem:
-    """Something left alone on purpose. kind: live, tied, lost, unreadable or future."""
+    """Something left alone on purpose. kind: live, tied, lost, held, unreadable or future."""
 
     kind: str
     session_id: str

@@ -88,6 +88,35 @@ class CreatingARecord(ApplierTest):
         self.assertEqual(self.names(self.box.b), [])
 
 
+    def test_a_create_and_its_journal_line_cannot_be_split_by_a_stop_signal(self):
+        # launchd stops an agent with SIGTERM. Landing between the link and the journal line, it
+        # would leave a completed create that looks as if it may never have happened.
+        import signal
+        import session_sync.applier as module
+        from session_sync.cli import install_sigterm_handler
+        previous = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        install_sigterm_handler()
+        write_record(self.box.a, X)
+        journal = []
+        scans = {str(p): scan_partition(p, {}, clock=lambda: NOW_NS) for p in (self.box.a, self.box.b)}
+        applier = Applier(scans, is_live=lambda partition: False, kept_dir=self.kept,
+                          before_create=lambda partition, sid: journal.append(("intend", sid)),
+                          after_create=lambda partition, sid: journal.append(("done", sid)))
+        real = module.commit_create
+
+        def stop_signal_right_after_the_link(temporary, destination):
+            real(temporary, destination)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        with mock.patch.object(module, "commit_create", stop_signal_right_after_the_link):
+            with self.assertRaises(SystemExit):
+                applier.apply(Plan(actions=[CreateRecord(X, source=self.A, target=self.B)]))
+
+        self.assertEqual(journal, [("intend", X), ("done", X)])
+        self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
+
+
 class ReplacingARecord(ApplierTest):
     def test_the_target_takes_the_sources_bytes(self):
         write_record(self.box.a, X, title="new")

@@ -100,8 +100,11 @@ def _plan_record(session_id: str, snapshots: List[Snapshot], holders: List[Snaps
     for target in snapshots:
         if session_id in target.records:
             continue
-        if not absence_explained and _was_held_by(target.key, session_id, state):  # R7
+        if not absence_explained and session_id in state.seen.get(target.key, ()):  # R7: it was here
             result.problems.append(Problem("lost", session_id, target.key))
+            continue
+        if not absence_explained and session_id in state.placing.get(target.key, ()):  # R7: it may have been
+            result.problems.append(Problem("held", session_id, target.key))
             continue
         result.actions.append(CreateRecord(session_id, source=winner.key, target=target.key))  # R5
     return True
@@ -143,6 +146,3 @@ def _latest_activity_winner(session_id: str, holders: List[Snapshot], prefer: Op
         return leaders[0]
     return next((s for s in leaders if s.key == prefer), None)
 
-
-def _was_held_by(partition: str, session_id: str, state: SyncState) -> bool:
-    return session_id in state.seen.get(partition, ()) or session_id in state.placing.get(partition, ())

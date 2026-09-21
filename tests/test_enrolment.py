@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 
 from session_sync.enrolment import EnrolmentError, enrol, load_enrolled, unenrol, unenrolled_with_records
@@ -67,6 +68,15 @@ class Enrolment(unittest.TestCase):
                 self.config.write_text(content)
                 with self.assertRaises(EnrolmentError):
                     load_enrolled(self.config)
+
+    def test_a_candidate_that_cannot_be_inspected_is_skipped_because_the_list_is_only_a_hint(self):
+        write_record(self.box.a, X)
+        locked = self.box.a.parent.parent / "dddddddd-0000-4000-8000-000000000004"
+        (locked / "dddddddd-0000-4000-8000-0000000000d4").mkdir(parents=True)
+        os.chmod(locked, 0o400)
+        self.addCleanup(os.chmod, locked, 0o700)
+
+        self.assertEqual(unenrolled_with_records([self.box.b]), {self.box.a: 1})
 
     def test_directories_with_records_that_are_not_enrolled_are_found(self):
         # a third login must be noticed, never merged on its own.

@@ -94,8 +94,7 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
     stored = _state_or_abort(settings)
     on_disk = encode_state(stored)
     intents = IntentLog(settings.intent_log_path)
-    for partition, session_ids in intents.read().items():  # left by a run that did not finish
-        stored.sync.placing.setdefault(partition, set()).update(session_ids)
+    _recover(stored, intents)
     if apply:
         _sweep_stale_temps(partitions + [settings.state_dir], now_ns())
         _sweep_stale_temps(_folders_under(settings.kept_root), now_ns())
@@ -120,8 +119,8 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
         save_state(settings.state_path, stored)
         on_disk = encode_state(stored)
     kept_dir = settings.kept_root / time.strftime("%Y%m%d-%H%M%S", time.localtime(now_ns() // 1_000_000_000))
-    applier = Applier(scans, kept_dir=kept_dir, before_create=intents.record, is_live=lambda partition: is_live(
-        partition, running(), now_ns() // 1_000_000, stored.logins))
+    applier = Applier(scans, kept_dir=kept_dir, before_create=intents.intend, after_create=intents.done,
+                      is_live=lambda partition: is_live(partition, running(), now_ns() // 1_000_000, stored.logins))
     report.outcomes = applier.apply(the_plan)
     _remember_placements(stored, report.done, scans)
 
@@ -135,6 +134,17 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
     _save_if_worth_it(settings, stored, on_disk, clean=not report.failures, now_ms=now_ns() // 1_000_000)
     intents.clear()
     return report
+
+
+def _recover(stored: StoredState, intents: IntentLog) -> None:
+    """Reads what a run that did not finish left in the journal. A create known to have completed
+    is presence like any other (R7). One with no proof is held back for a run. The journal stays
+    on disk until a run has saved its state, so nothing here needs saving early."""
+    journal = intents.read()
+    for partition, session_ids in journal.completed.items():
+        stored.sync.seen.setdefault(partition, set()).update(session_ids)
+    for partition, session_ids in journal.pending.items():
+        stored.sync.placing.setdefault(partition, set()).update(session_ids)
 
 
 def _remember_what_was_seen(stored: StoredState, scans: Dict[str, PartitionScan]) -> bool:

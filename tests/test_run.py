@@ -294,6 +294,62 @@ class PresenceSeenDuringARun(RunTest):
         self.assertNotIn("local_%s.json" % X, self.names(self.box.b))
 
 
+class CreatesOfARunThatDidNotFinish(RunTest):
+    """R7: a create that is known to have completed counts as present, whatever happened to the run."""
+
+    def a_run_creates_x_in_a_and_then(self, fails_with, at):
+        write_record(self.box.a, Y)
+        self.sync()
+        write_record(self.box.b, X)
+        with mock.patch(at, side_effect=fails_with):
+            with self.assertRaises(type(fails_with) if not isinstance(fails_with, type) else fails_with):
+                self.sync()
+        self.assertIn("local_%s.json" % X, self.names(self.box.a), "the create itself completed")
+        (self.box.a / ("local_%s.json" % X)).unlink()  # removed afterwards, with no tombstone
+
+    def assert_never_created_again(self):
+        for _ in range(3):
+            report = self.sync()
+            self.assertNotIn("local_%s.json" % X, self.names(self.box.a))
+            self.assertIn(("lost", X, str(self.box.a)), {(p.kind, p.session_id, p.partition) for p in report.problems})
+
+    def test_a_completed_create_is_not_repeated_after_the_run_was_interrupted(self):
+        self.a_run_creates_x_in_a_and_then(KeyboardInterrupt, at="session_sync.run._remember_placements")
+
+        self.assert_never_created_again()
+
+    def test_a_completed_create_is_not_repeated_after_the_final_scan_failed(self):
+        import session_sync.run as module
+        real = module._scan_or_abort
+        calls = []
+
+        def second_scan_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RunAborted("the final scan could not read a partition")
+            return real(*args, **kwargs)
+
+        write_record(self.box.a, Y)
+        self.sync()
+        write_record(self.box.b, X)
+        with mock.patch.object(module, "_scan_or_abort", second_scan_fails):
+            with self.assertRaises(RunAborted):
+                self.sync()
+        (self.box.a / ("local_%s.json" % X)).unlink()
+
+        self.assert_never_created_again()
+
+    def test_recreate_still_lifts_the_hold(self):
+        from session_sync.run import forget_presence
+        self.a_run_creates_x_in_a_and_then(KeyboardInterrupt, at="session_sync.run._remember_placements")
+        self.sync()
+
+        forget_presence(self.settings, X)
+        self.sync()
+
+        self.assertIn("local_%s.json" % X, self.names(self.box.a))
+
+
 class UntrustworthyTimes(RunTest):
     def test_activity_dated_in_the_future_decides_nothing(self):
         # A record saved while the clock ran ahead. Read as "now" it would outrank every
@@ -342,6 +398,26 @@ class UnreadableFiles(RunTest):
         os.chmod(locked, 0o600)  # repaired without touching the file's time or size
         self.sync()
         self.assertEqual(self.names(self.box.a), ["local_%s.json" % X], "B's later activity now counts")
+
+    def test_a_partition_whose_entries_cannot_be_inspected_stops_the_run_before_any_change(self):
+        # Mode 0400: the directory can be listed but nothing in it can be stat'ed. Read as empty,
+        # it would hide B's newer copy while C's is retired.
+        third = self.box.partition("cccccccc-0000-4000-8000-000000000003", "cccccccc-0000-4000-8000-0000000000c3")
+        self.settings.config_path.write_text(json.dumps(
+            {"partitions": [str(self.box.a), str(third), str(self.box.b)]}))
+        write_tombstone(self.box.a, X, deleted_at_ms=500)
+        write_record(self.box.b, X, activity=900)
+        write_record(third, X, activity=100)
+        (self.box.b / ".sync-1-local_x.json.part").write_text("left by a run that was killed")
+        os.chmod(self.box.b, 0o400)
+        self.addCleanup(os.chmod, self.box.b, 0o700)
+
+        with self.assertRaises(RunAborted) as raised:  # the sweep before the scan must not trip over it either
+            self.sync()
+
+        self.assertIn(str(self.box.b), str(raised.exception))
+        self.assertEqual(self.names(third), ["local_%s.json" % X])
+        self.assertEqual(self.names(self.box.a), ["deleted_%s" % X])
 
     def test_a_partition_that_cannot_be_listed_stops_the_run_cleanly(self):
         write_record(self.box.a, X)
@@ -526,7 +602,8 @@ class SafetyNets(RunTest):
             with self.assertRaises(KeyboardInterrupt):
                 self.sync()
 
-        self.assertEqual(IntentLog(self.settings.intent_log_path).read(), {str(self.box.b): {X}})
+        journal = IntentLog(self.settings.intent_log_path).read()
+        self.assertEqual((journal.pending, journal.completed), ({str(self.box.b): {X}}, {}))
 
     def test_an_unenrolled_partition_with_records_is_reported_and_untouched(self):
         third = self.box.partition("cccccccc-0000-4000-8000-000000000003", "cccccccc-0000-4000-8000-0000000000c3")
@@ -613,7 +690,7 @@ class SafetyNets(RunTest):
         after = self.sync()
 
         self.assertEqual(self.names(self.box.b), ["local_%s.json" % X, "local_%s.json" % Z])
-        self.assertEqual([(p.kind, p.session_id) for p in after.problems], [("lost", Y)])
+        self.assertEqual([(p.kind, p.session_id) for p in after.problems], [("held", Y)])
         self.sync()
         self.assertEqual(len(self.names(self.box.b)), 3, "the held create goes through one run later")
 

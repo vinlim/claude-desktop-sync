@@ -135,7 +135,7 @@ planned     3  create record -> 1a2b3c4d/9f8e7d6c
 Dry run. Pass --apply to write.
 ```
 
-A line that starts with a session id is something the tool left alone on purpose, with the reason: the directory is in use, the copies are tied, the record was lost without a delete marker, a copy cannot be read, or a copy's last activity is dated in the future. `In sync.` means there was nothing to do.
+A line that starts with a session id is something the tool left alone on purpose, with the reason: the directory is in use, the copies are tied, the record was lost without a delete marker, a copy cannot be read, a copy's last activity is dated in the future, or a create from a run that did not finish is being held back for one run. `In sync.` means there was nothing to do.
 
 ## Where it keeps things
 

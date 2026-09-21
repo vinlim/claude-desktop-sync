@@ -102,12 +102,19 @@ def unenrolled_with_records(enrolled: List[Path], also_under: Sequence[Path] = (
 
 
 def _real_uuid_dirs(parent: Path) -> List[Path]:
+    """Best effort: this only feeds the list of candidates, which decides nothing."""
+    found = []
     try:
         names = sorted(os.listdir(parent))
     except OSError:
-        return []
-    return [parent / name for name in names
-            if UUID.match(name) and stat.S_ISDIR(os.lstat(parent / name).st_mode)]
+        return found
+    for name in names:
+        try:
+            if UUID.match(name) and stat.S_ISDIR(os.lstat(parent / name).st_mode):
+                found.append(parent / name)
+        except OSError:
+            continue
+    return found
 
 
 def _save(config: Path, enrolled: List[Path]) -> None:

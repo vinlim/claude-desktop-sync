@@ -45,15 +45,24 @@ def tombstone_path(partition: Path, session_id: str) -> Path:
     return partition / ("deleted_%s" % session_id)
 
 
-def stamp_of(path: Path) -> Optional[Stamp]:
-    """None unless the path is a regular file right now."""
+def inspect(path: Path) -> Optional[Stamp]:
+    """None when the path is gone or is not a regular file. Any other failure is raised: a scan
+    that could not look at an entry knows nothing about it, and must not read that as absence."""
     try:
         info = os.lstat(path)
-    except OSError:
+    except FileNotFoundError:
         return None
     if not stat.S_ISREG(info.st_mode):
         return None
     return (info.st_mtime_ns, info.st_size)
+
+
+def stamp_of(path: Path) -> Optional[Stamp]:
+    """For guards and cleanup: what cannot be inspected is simply not what was scanned."""
+    try:
+        return inspect(path)
+    except OSError:
+        return None
 
 
 def scan_partition(path: Path, cache: Dict[str, CacheEntry], clock: Callable[[], int]) -> PartitionScan:
@@ -67,7 +76,7 @@ def scan_partition(path: Path, cache: Dict[str, CacheEntry], clock: Callable[[],
 
     for name in sorted(os.listdir(path)):
         entry = path / name
-        stamp = stamp_of(entry)  # the app may rename or remove files under the scan
+        stamp = inspect(entry)  # None: the app renamed or removed it under the scan
         if stamp is None:
             continue
         record, tmp, tombstone = RECORD_NAME.match(name), TMP_NAME.match(name), TOMBSTONE_NAME.match(name)
@@ -122,7 +131,5 @@ def _read_delete_time(path: Path, clock: Callable[[], int]) -> Optional[int]:
     now_ms = clock() // 1_000_000
     if 0 <= claimed <= now_ms:
         return claimed
-    try:
-        return min(os.lstat(path).st_mtime_ns // 1_000_000, now_ms)
-    except OSError:
-        return None
+    written = inspect(path)
+    return None if written is None else min(written[0] // 1_000_000, now_ms)

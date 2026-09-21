@@ -11,34 +11,50 @@ class IntentLogTest(unittest.TestCase):
         self.log = IntentLog(self.box.state_dir / "placing.log")
 
     def test_nothing_recorded_reads_as_nothing(self):
-        self.assertEqual(self.log.read(), {})
+        journal = self.log.read()
 
-    def test_what_was_recorded_is_read_back_per_partition(self):
-        self.log.record("/p/a", X)
-        self.log.record("/p/b", X)
-        self.log.record("/p/b", Y)
+        self.assertEqual((journal.pending, journal.completed), ({}, {}))
 
-        self.assertEqual(IntentLog(self.log.path).read(), {"/p/a": {X}, "/p/b": {X, Y}})
+    def test_a_create_is_pending_until_it_is_marked_done(self):
+        self.log.intend("/p/a", X)
+        self.log.intend("/p/b", X)
+        self.log.intend("/p/b", Y)
+        self.log.done("/p/b", X)
+
+        journal = IntentLog(self.log.path).read()
+
+        self.assertEqual(journal.pending, {"/p/a": {X}, "/p/b": {Y}})
+        self.assertEqual(journal.completed, {"/p/b": {X}})
 
     def test_a_partition_path_with_spaces_survives(self):
-        self.log.record("/Users/me/Library/Application Support/Claude/x/y", X)
+        path = "/Users/me/Library/Application Support/Claude/x/y"
+        self.log.intend(path, X)
+        self.log.done(path, X)
 
-        self.assertEqual(self.log.read(), {"/Users/me/Library/Application Support/Claude/x/y": {X}})
+        self.assertEqual(self.log.read().completed, {path: {X}})
 
     def test_a_line_torn_by_a_crash_is_ignored(self):
-        self.log.record("/p/a", X)
+        self.log.intend("/p/a", X)
         with open(self.log.path, "a") as handle:
-            handle.write("/p/a\t2222")  # no newline: the write never finished
+            handle.write("done\t/p/a\t1111")  # no newline: the write never finished
 
-        self.assertEqual(self.log.read(), {"/p/a": {X}})
+        journal = self.log.read()
+
+        self.assertEqual((journal.pending, journal.completed), ({"/p/a": {X}}, {}))
+
+    def test_a_done_line_with_no_intent_still_counts(self):
+        # The intent line and the done line are separate writes; only the second says it happened.
+        self.log.done("/p/a", X)
+
+        self.assertEqual(self.log.read().completed, {"/p/a": {X}})
 
     def test_clearing_forgets_everything_and_is_safe_to_repeat(self):
-        self.log.record("/p/a", X)
+        self.log.intend("/p/a", X)
 
         self.log.clear()
         self.log.clear()
 
-        self.assertEqual(self.log.read(), {})
+        self.assertEqual(self.log.read().pending, {})
 
 
 if __name__ == "__main__":

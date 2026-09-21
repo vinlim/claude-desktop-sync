@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""Keep the Claude desktop app's Code sidebar the same under every account.
+
+The app keeps one session list per login, in
+<userData>/claude-code-sessions/<accountUuid>/<orgUuid>/. A record names no
+account, so any account can load it. This copies records and delete tombstones
+between those directories. The newest record wins, and a delete made under one
+account retires the stale copies under the others.
+
+Dry run by default. Pass --apply to write.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import plistlib
+import re
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, NamedTuple, Optional, Set
+
+DEFAULT_ROOT = Path.home() / "Library" / "Application Support" / "Claude"
+SESSIONS_DIR = "claude-code-sessions"
+STATE_DIR = Path.home() / ".local" / "state" / "claude-desktop-session-sync"
+AGENT_LABEL = "local.claude-desktop-session-sync"
+AGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / (AGENT_LABEL + ".plist")
+
+UUID = r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}"
+UUID_RE = re.compile(r"^%s$" % UUID)
+RECORD_RE = re.compile(r"^local_(%s)\.json$" % UUID)
+TOMBSTONE_RE = re.compile(r"^deleted_(%s)$" % UUID)
+
+# The main binary only. Helper processes live under Contents/Frameworks.
+APP_PROCESS = r"Claude\.app/Contents/MacOS/Claude( |$)"
+
+
+class FileStamp(NamedTuple):
+    mtime_ns: int
+    size: int
+
+
+class Partition:
+    """One account and org's session directory."""
+
+    def __init__(self, root: Path, account: str, org: str) -> None:
+        self.root = root
+        self.account = account
+        self.org = org
+        self.path = root / SESSIONS_DIR / account / org
+        self.records: Dict[str, FileStamp] = {}
+        self.tombstones: Set[str] = set()
+
+    @property
+    def label(self) -> str:
+        return "%s/%s" % (self.account[:8], self.org[:8])
+
+    def record_path(self, session_id: str) -> Path:
+        return self.path / ("local_%s.json" % session_id)
+
+    def tombstone_path(self, session_id: str) -> Path:
+        return self.path / ("deleted_%s" % session_id)
+
+    def deleted_at_ms(self, session_id: str) -> int:
+        """A tombstone holds the delete time in epoch milliseconds."""
+        path = self.tombstone_path(session_id)
+        try:
+            return int(path.read_text().strip())
+        except (OSError, ValueError):
+            return os.lstat(path).st_mtime_ns // 1_000_000
+
+    def scan(self) -> None:
+        self.records.clear()
+        self.tombstones.clear()
+        for entry in os.scandir(self.path):
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            record = RECORD_RE.match(entry.name)
+            if record:
+                info = entry.stat(follow_symlinks=False)
+                self.records[record.group(1).lower()] = FileStamp(info.st_mtime_ns, info.st_size)
+                continue
+            tombstone = TOMBSTONE_RE.match(entry.name)
+            if tombstone:
+                self.tombstones.add(tombstone.group(1).lower())
+
+
+class Action(NamedTuple):
+    kind: str  # "copy", "retire" or "tombstone"
+    session_id: str
+    target: Partition
+    source: Optional[Partition]
+    expected: Optional[FileStamp]  # the target's record when planned; None if absent
+
+
+class Skip(NamedTuple):
+    session_id: str
+    target: Partition
+    reason: str
+
+
+def is_real_dir(path: Path) -> bool:
+    """The app refuses symlinked session directories, so they are not partitions."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def discover(roots: List[Path]) -> List[Partition]:
+    """Partitions that hold at least one record or tombstone.
+
+    An account switch leaves empty account and org cross-pairs behind. Those
+    hold no sessions and must not receive a copy of everything.
+    """
+    found = []
+    for root in roots:
+        base = root / SESSIONS_DIR
+        if not is_real_dir(base):
+            continue
+        for account in sorted(os.listdir(base)):
+            if not UUID_RE.match(account) or not is_real_dir(base / account):
+                continue
+            for org in sorted(os.listdir(base / account)):
+                if not UUID_RE.match(org) or not is_real_dir(base / account / org):
+                    continue
+                partition = Partition(root, account, org)
+                partition.scan()
+                if partition.records or partition.tombstones:
+                    found.append(partition)
+    return found
+
+
+def app_running() -> bool:
+    return subprocess.run(["pgrep", "-f", APP_PROCESS], capture_output=True).returncode == 0
+
+
+def last_known_account(root: Path) -> Optional[str]:
+    try:
+        value = json.loads((root / "config.json").read_text()).get("lastKnownAccountUuid")
+    except (OSError, ValueError):
+        return None
+    return value.lower() if isinstance(value, str) else None
+
+
+def live_partitions(partitions: List[Partition], running: bool) -> Set[Path]:
+    """Partitions a running app may hold in memory.
+
+    The app never rereads a loaded partition, and it rewrites a record on every
+    save, so an existing record there must not be replaced or removed. With no
+    readable account the whole root counts as live.
+    """
+    if not running:
+        return set()
+    live = set()
+    for partition in partitions:
+        account = last_known_account(partition.root)
+        if account is None or account == partition.account.lower():
+            live.add(partition.path)
+    return live
+
+
+def plan(partitions: List[Partition], live: Set[Path]):
+    actions: List[Action] = []
+    skips: List[Skip] = []
+
+    tombstone_holders: Dict[str, List[Partition]] = {}
+    for partition in partitions:
+        for session_id in partition.tombstones:
+            tombstone_holders.setdefault(session_id, []).append(partition)
+
+    session_ids = sorted({sid for partition in partitions for sid in partition.records})
+    for session_id in session_ids:
+        holders = [p for p in partitions if session_id in p.records]
+        newest = max(holders, key=lambda p: p.records[session_id])
+        newest_stamp = newest.records[session_id]
+
+        deleted_at = max((p.deleted_at_ms(session_id) for p in tombstone_holders.get(session_id, [])), default=None)
+        if deleted_at is not None and deleted_at * 1_000_000 >= newest_stamp.mtime_ns:
+            for holder in holders:
+                if holder.path in live:
+                    skips.append(Skip(session_id, holder, "deleted elsewhere, but this partition is live"))
+                else:
+                    actions.append(Action("retire", session_id, holder, None, holder.records[session_id]))
+            continue
+
+        for target in partitions:
+            if target is newest:
+                continue
+            have = target.records.get(session_id)
+            if have is None:
+                actions.append(Action("copy", session_id, target, newest, None))
+            elif have.mtime_ns < newest_stamp.mtime_ns:
+                if target.path in live:
+                    skips.append(Skip(session_id, target, "newer copy elsewhere, but this partition is live"))
+                else:
+                    actions.append(Action("copy", session_id, target, newest, have))
+            elif have != newest_stamp:
+                skips.append(Skip(session_id, target, "same timestamp, different size"))
+
+    for session_id, holders in sorted(tombstone_holders.items()):
+        for target in partitions:
+            if session_id not in target.tombstones:
+                actions.append(Action("tombstone", session_id, target, holders[0], None))
+
+    return actions, skips
+
+
+def stamp_of(path: Path) -> Optional[FileStamp]:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return FileStamp(info.st_mtime_ns, info.st_size)
+
+
+def place(data: bytes, destination: Path, mtime_ns: int) -> None:
+    """Write atomically, as the app does, so a reader never sees half a file.
+
+    The temporary name must not look like local_*.json.tmp: the app promotes
+    orphans of that shape to live records at startup.
+    """
+    temporary = destination.parent / (".sync-%d-%s.part" % (os.getpid(), destination.name))
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.utime(temporary, ns=(mtime_ns, mtime_ns))
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def apply_copy(action: Action) -> Optional[str]:
+    source_path = action.source.record_path(action.session_id)
+    target_path = action.target.record_path(action.session_id)
+
+    before = stamp_of(source_path)
+    if before is None:
+        return "source vanished"
+    data = source_path.read_bytes()
+    if stamp_of(source_path) != before:
+        return "source changed while reading"
+    try:
+        record = json.loads(data)
+    except ValueError:
+        return "source is not valid JSON"
+    if not isinstance(record, dict) or str(record.get("sessionId", "")).lower() != "local_" + action.session_id:
+        return "source does not describe this session"
+    if stamp_of(target_path) != action.expected:
+        return "target changed since planning"
+
+    place(data, target_path, before.mtime_ns)
+    return None
+
+
+def apply_retire(action: Action, retired_dir: Path) -> Optional[str]:
+    target_path = action.target.record_path(action.session_id)
+    if stamp_of(target_path) != action.expected:
+        return "target changed since planning"
+    keep = retired_dir / ("%s_%s" % (action.target.account, action.target.org))
+    keep.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.replace(target_path, keep / target_path.name)
+    return None
+
+
+def apply_tombstone(action: Action) -> Optional[str]:
+    source_path = action.source.tombstone_path(action.session_id)
+    target_path = action.target.tombstone_path(action.session_id)
+    if target_path.exists():
+        return None
+    try:
+        data = source_path.read_bytes()
+        mtime_ns = os.lstat(source_path).st_mtime_ns
+    except FileNotFoundError:
+        return "source vanished"
+    place(data, target_path, mtime_ns)
+    return None
+
+
+def run(roots: List[Path], apply: bool, verbose: bool = False, quiet: bool = False,
+        running: Optional[bool] = None, retired_root: Optional[Path] = None, out=sys.stdout) -> int:
+    partitions = discover(roots)
+    if len(partitions) < 2:
+        if not quiet:
+            print("Nothing to sync: found %d partition(s) with sessions." % len(partitions), file=out)
+        return 0
+
+    running = app_running() if running is None else running
+    live = live_partitions(partitions, running)
+    actions, skips = plan(partitions, live)
+
+    lines = ["%s  %4d records %4d tombstones%s" % (
+        partition.label, len(partition.records), len(partition.tombstones),
+        "  (live)" if partition.path in live else "") for partition in partitions]
+
+    retired_dir = (retired_root or STATE_DIR / "retired") / time.strftime("%Y%m%d-%H%M%S")
+    counts: Dict[str, int] = {}
+    failures = 0
+    for action in actions:
+        problem = None
+        if apply:
+            try:
+                if action.kind == "copy":
+                    problem = apply_copy(action)
+                elif action.kind == "retire":
+                    problem = apply_retire(action, retired_dir)
+                else:
+                    problem = apply_tombstone(action)
+            except OSError as error:
+                problem = "%s: %s" % (type(error).__name__, error)
+        if problem:
+            failures += 1
+            lines.append("  not done  %-9s %s -> %s: %s" % (action.kind, action.session_id, action.target.label, problem))
+            continue
+        key = "%s -> %s" % (action.kind, action.target.label)
+        counts[key] = counts.get(key, 0) + 1
+        if verbose:
+            lines.append("  %-9s %s -> %s" % (action.kind, action.session_id, action.target.label))
+
+    for key in sorted(counts):
+        lines.append("%s %5d  %s" % ("done   " if apply else "planned", counts[key], key))
+
+    # A skip repeats on every run while its partition stays live, so an
+    # unattended log records only what was written or what failed.
+    if quiet:
+        if counts or failures:
+            print("\n".join([time.strftime("%Y-%m-%d %H:%M:%S")] + lines), file=out)
+        return 1 if failures else 0
+
+    for skip in skips:
+        lines.append("skipped  %s in %s: %s" % (skip.session_id, skip.target.label, skip.reason))
+    if not actions and not skips:
+        lines.append("In sync.")
+    elif not apply and actions:
+        lines.append("Dry run. Pass --apply to write.")
+    print("\n".join(lines), file=out)
+    return 1 if failures else 0
+
+
+def agent_plist(roots: List[Path], explicit_roots: bool) -> dict:
+    arguments = ["/usr/bin/python3", str(Path(__file__).resolve()), "--apply", "--quiet"]
+    if explicit_roots:
+        for root in roots:
+            arguments += ["--root", str(root)]
+    log = str(STATE_DIR / "agent.log")
+    return {
+        "Label": AGENT_LABEL,
+        "ProgramArguments": arguments,
+        # launchd watches a directory's own entries, which is what the app's
+        # write-then-rename saves change. The interval covers a new partition.
+        "WatchPaths": [str(partition.path) for partition in discover(roots)],
+        "StartInterval": 300,
+        "ThrottleInterval": 10,
+        "RunAtLoad": True,
+        "ProcessType": "Background",
+        "StandardOutPath": log,
+        "StandardErrorPath": log,
+    }
+
+
+def install_agent(roots: List[Path], explicit_roots: bool) -> int:
+    uninstall_agent(announce=False)
+    AGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    with open(AGENT_PLIST, "wb") as handle:
+        plistlib.dump(agent_plist(roots, explicit_roots), handle)
+    result = subprocess.run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(AGENT_PLIST)],
+                            capture_output=True, text=True)
+    if result.returncode:
+        print("launchctl could not load the agent: %s" % result.stderr.strip())
+        return 1
+    print("Installed %s\nIt logs to %s" % (AGENT_PLIST, STATE_DIR / "agent.log"))
+    return 0
+
+
+def uninstall_agent(announce: bool = True) -> int:
+    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), AGENT_LABEL)], capture_output=True)
+    existed = AGENT_PLIST.exists()
+    if existed:
+        AGENT_PLIST.unlink()
+    if announce:
+        print("Removed the agent." if existed else "No agent was installed.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--apply", action="store_true", help="write changes (default is a dry run)")
+    parser.add_argument("--verbose", action="store_true", help="list every action")
+    parser.add_argument("--quiet", action="store_true", help="print only what was written or what failed")
+    parser.add_argument("--root", action="append", type=Path, default=None,
+                        help="a desktop app data directory; repeat for a second app instance "
+                             "(default: %s)" % DEFAULT_ROOT)
+    parser.add_argument("--install-agent", action="store_true",
+                        help="sync in the background whenever a session directory changes")
+    parser.add_argument("--uninstall-agent", action="store_true", help="remove the background agent")
+    args = parser.parse_args()
+    roots = [root.expanduser().resolve() for root in (args.root or [DEFAULT_ROOT])]
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if args.uninstall_agent:
+        return uninstall_agent()
+    # Newest-file-wins can replace real session state with an older copy that
+    # was merely clicked, so writing stays off until the rule is replaced.
+    if args.apply or args.install_agent:
+        print("Writing is disabled: the newest-file-wins rule can lose session state. Dry runs still work.")
+        return 2
+
+    with open(STATE_DIR / "lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if not args.quiet:
+                print("Another sync is running.")
+            return 0
+        return run(roots, args.apply, verbose=args.verbose, quiet=args.quiet)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

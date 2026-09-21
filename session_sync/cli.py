@@ -11,11 +11,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, TextIO
 
-from session_sync import agent
+from session_sync import agent, backups
 from session_sync.enrolment import EnrolmentError, SESSIONS_DIR, enrol, load_enrolled, unenrol, unenrolled_with_records
 from session_sync.liveness import app_running
 from session_sync.report import render
-from session_sync.run import RunAborted, Settings, forget_presence, remember_reported, sync
+from session_sync.run import RunAborted, Settings, forget_presence, label, remember_reported, sync
 from session_sync.state_store import StateUnusable, load_state
 
 DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "claude-desktop-session-sync"
@@ -62,6 +62,14 @@ def main(argv: List[str], env: Optional[Environment] = None) -> int:
     try:
         if args.session and not args.prefer:
             raise RunAborted("--session only narrows --prefer. Name the partition to prefer as well.")
+        if args.note and not args.backup:
+            raise RunAborted("--note goes with --backup.")
+        if args.backup:
+            return _backup(args.note or "", env, say)
+        if args.backups:
+            return _backups(env, say)
+        if args.restore:
+            return _restore(args.restore, args.apply, env, say)
         if args.enroll or args.unenroll:
             return _change_enrolment(args, env, say)
         if args.list:
@@ -79,7 +87,8 @@ def main(argv: List[str], env: Optional[Environment] = None) -> int:
             say("Removed the agent." if removed else "No agent was installed.")
             return 0
         return _run(args, env, say)
-    except (RunAborted, EnrolmentError, agent.AgentError, StateUnusable, SyncBusy) as error:
+    except (RunAborted, EnrolmentError, agent.AgentError, StateUnusable, SyncBusy, backups.BackupFailed,
+            backups.BackupUnusable, backups.RestoreRefused) as error:
         _say_abort(str(error), args.quiet, env, say)
         return 2
 
@@ -112,6 +121,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--unenroll", action="append", metavar="PATH", help="stop syncing a partition")
     parser.add_argument("--status", action="store_true", help="last clean run, agent, standing problems")
     parser.add_argument("--reset-state", action="store_true", help="forget sync history (the old file is kept)")
+    parser.add_argument("--backup", action="store_true", help="save the enrolled partitions and the sync history")
+    parser.add_argument("--note", metavar="TEXT", help="with --backup: a few words to find it by later")
+    parser.add_argument("--backups", action="store_true", help="list the backups")
+    parser.add_argument("--restore", metavar="ID",
+                        help="go back to a backup (dry run unless --apply; the desktop app must be quit)")
     parser.add_argument("--install-agent", action="store_true", help="sync in the background on every change")
     parser.add_argument("--uninstall-agent", action="store_true", help="remove the background agent")
     return parser
@@ -266,6 +280,8 @@ def _status(env: Environment, say) -> int:
     last = load_state(env.settings.state_path).last_success_ms
     age_ms = env.now_ns() // 1_000_000 - last
     say("last clean run: %s" % (_ago(age_ms) if last else "never"))
+    saved = [entry for entry in backups.listing(env.settings.backups_root) if entry.usable]
+    say("backups: %s" % ("%d, newest %s" % (len(saved), saved[0].id) if saved else "none. Take one with --backup"))
     if installed and not last:
         say("The agent is installed but has never had a clean run. Check %s" % env.settings.log_path)
     elif installed and age_ms > STALE_AGENT_S * 1000:
@@ -275,6 +291,89 @@ def _status(env: Environment, say) -> int:
         report = sync(env.settings, apply=False, now_ns=env.now_ns, running=env.running)
         say(render(report)[0])
     return 0
+
+
+def _backup(note: str, env: Environment, say) -> int:
+    with _run_lock(env, env.lock_wait_s):  # a run in flight has the folders half way between two states
+        taken = backups.take(_enrolled_or_refuse(env, "back up"), env.settings.state_path, env.settings.backups_root,
+                             reason="asked for", note=note, now_ns=env.now_ns)
+    say("Saved backup %s (%s): %s\n%s" % (taken.id, _megabytes(taken.size_bytes), _counted(taken), taken.path))
+    if taken.unreadable:
+        say("%d files could not be read and were left out. A restore leaves those alone." % taken.unreadable)
+    for name in taken.pruned:
+        say("Removed the oldest backup, %s. The newest %d are kept." % (name, backups.KEEP))
+    say("To go back to it later: --restore %s" % taken.id)
+    return 0
+
+
+def _backups(env: Environment, say) -> int:
+    found = backups.listing(env.settings.backups_root)
+    for entry in found:
+        if entry.usable:
+            words = entry.reason + (': "%s"' % entry.note if entry.note else "")
+            say("%s  %7s  %s  %s" % (entry.id, _megabytes(entry.size_bytes), _counted(entry), words))
+        else:
+            say("%s  %7s  cannot be used: %s" % (entry.id, _megabytes(entry.size_bytes), entry.reason))
+    if not found:
+        say("No backups yet. Take one with --backup.")
+    return 0
+
+
+def _restore(backup_id: str, apply: bool, env: Environment, say) -> int:
+    with _run_lock(env, env.lock_wait_s):
+        partitions = _enrolled_or_refuse(env, "restore")
+        chosen = backups.find(env.settings.backups_root, backup_id)
+        if not chosen.usable:
+            raise backups.BackupUnusable("Backup %s %s. Nothing was changed." % (chosen.id, chosen.reason))
+        plan = backups.plan_restore(chosen.path, partitions)
+        word = "wrote" if apply else "would write"
+        for partition in (str(path) for path in partitions):
+            say("%s  %s %d, %s %d, %d already as they were" % (
+                label(Path(partition)), word, len(plan.writes[partition]),
+                "removed" if apply else "would remove", len(plan.removals[partition]), plan.unchanged[partition]))
+        if not apply:
+            say("The sync history %s." % ("would be put back as it was" if plan.restores_state
+                                          else "would be set aside: this backup predates it"))
+            say("Dry run. Pass --apply to restore.%s" % (
+                " Quit the Claude desktop app first." if env.running() else ""))
+            return 0
+        _refuse_beside_the_app(env)
+        present = backups.take(partitions, env.settings.state_path, env.settings.backups_root,
+                               reason="before restoring %s" % chosen.id, now_ns=env.now_ns)
+        _refuse_beside_the_app(env)  # taking that backup took a moment
+        backups.apply_restore(plan, env.settings.state_path, now_ns=env.now_ns)
+    say("The sync history was %s." % ("put back as it was" if plan.restores_state
+                                      else "set aside: this backup predates it"))
+    say("Went back to backup %s. Reopen the Claude desktop app.\n"
+        "The state before this restore was saved first. To undo the restore: --restore %s --apply"
+        % (chosen.id, present.id))
+    return 0
+
+
+def _refuse_beside_the_app(env: Environment) -> None:
+    if env.running():
+        # The app holds the current login's sessions in memory and writes them back, and it reads
+        # a partition only when a login starts (F4), so a restore beside it would not hold.
+        raise RunAborted("Quit the Claude desktop app first, then run this again. The app would write its own "
+                         "copy of the sessions over the restored files. Nothing was changed.")
+
+
+def _enrolled_or_refuse(env: Environment, verb: str) -> List[Path]:
+    enrolled = load_enrolled(env.settings.config_path)
+    if not enrolled:
+        raise EnrolmentError("Nothing is enrolled, so there is nothing to %s. Enrol each account's directory "
+                             "with --enroll PATH." % verb)
+    return enrolled
+
+
+def _megabytes(size: int) -> str:
+    return "%.1f MB" % (size / 1_000_000)
+
+
+def _counted(entry: backups.BackupInfo) -> str:
+    return "%d folders, %d records, %d delete markers" % (
+        len(entry.counts), sum(records for _, records, _ in entry.counts),
+        sum(markers for _, _, markers in entry.counts))
 
 
 def _install_agent(env: Environment, say) -> int:

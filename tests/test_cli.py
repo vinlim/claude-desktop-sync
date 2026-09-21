@@ -320,6 +320,183 @@ class AgentUpkeep(CliTest):
         self.assertIn("no clean run for", self.run_cli("--status")[1])
 
 
+class Backups(CliTest):
+    def ids(self):
+        from session_sync import backups
+        return [entry.id for entry in backups.listing(self.settings.backups_root)]
+
+    def renamed_since_a_backup(self):
+        self.enrol_both()
+        write_record(self.box.a, X, title="as it was")
+        self.run_cli("--backup")
+        write_record(self.box.a, X, at_s=LONG_AGO_S + 9, title="renamed since")
+        (only,) = self.ids()
+        return only
+
+    def test_a_backup_is_one_command_and_the_list_shows_it(self):
+        self.enrol_both()
+        write_record(self.box.a, X)
+
+        code, text = self.run_cli("--backup", "--note", "before tidying")
+        _, listed = self.run_cli("--backups")
+
+        self.assertEqual(code, 0)
+        (only,) = self.ids()
+        self.assertIn("Saved backup %s" % only, text)
+        self.assertIn(str(self.settings.backups_root / (only + ".zip")), text)
+        for expected in (only, "before tidying", "1 records"):
+            self.assertIn(expected, listed)
+
+    def test_with_no_backups_the_list_says_how_to_take_one(self):
+        self.enrol_both()
+
+        self.assertIn("--backup", self.run_cli("--backups")[1])
+
+    def test_a_note_without_a_backup_is_refused(self):
+        self.enrol_both()
+
+        code, text = self.run_cli("--note", "stray")
+
+        self.assertEqual(code, 2)
+        self.assertIn("--backup", text)
+
+    def test_a_restore_is_a_dry_run_unless_told_to_apply(self):
+        only = self.renamed_since_a_backup()
+
+        code, text = self.run_cli("--restore", only)
+
+        self.assertEqual(code, 0)
+        self.assertIn("would write 1", text)
+        self.assertIn("Dry run", text)
+        self.assertEqual(title_of(self.box.a, X), "renamed since")
+        self.assertEqual(self.ids(), [only], "a dry run saves nothing either")
+
+    def test_a_restore_is_refused_while_the_app_runs(self):
+        only = self.renamed_since_a_backup()
+        self.running = True
+
+        code, text = self.run_cli("--restore", only, "--apply")
+
+        self.assertEqual(code, 2)
+        self.assertIn("Quit", text)
+        self.assertEqual(title_of(self.box.a, X), "renamed since")
+        self.assertEqual(self.ids(), [only])
+
+    def test_an_app_that_starts_while_the_present_is_being_saved_still_stops_the_restore(self):
+        from unittest import mock
+        from session_sync import backups
+        only = self.renamed_since_a_backup()
+        real = backups.take
+
+        def the_app_starts_meanwhile(*args, **kwargs):
+            self.running = True
+            return real(*args, **kwargs)
+
+        with mock.patch.object(backups, "take", the_app_starts_meanwhile):
+            code, text = self.run_cli("--restore", only, "--apply")
+
+        self.assertEqual(code, 2)
+        self.assertIn("Quit", text)
+        self.assertEqual(title_of(self.box.a, X), "renamed since")
+
+    def test_a_dry_run_warns_that_the_app_has_to_be_quit(self):
+        only = self.renamed_since_a_backup()
+        self.running = True
+
+        self.assertIn("Quit", self.run_cli("--restore", only)[1])
+
+    def test_a_restore_saves_the_present_first_and_can_itself_be_undone(self):
+        only = self.renamed_since_a_backup()
+
+        code, text = self.run_cli("--restore", only, "--apply")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(title_of(self.box.a, X), "as it was")
+        present, _ = self.ids()
+        self.assertIn("--restore %s" % present, text)
+
+        self.run_cli("--restore", present, "--apply")
+
+        self.assertEqual(title_of(self.box.a, X), "renamed since")
+
+    def test_an_unknown_backup_is_refused_with_a_pointer_to_the_list(self):
+        self.enrol_both()
+
+        code, text = self.run_cli("--restore", "20990101-000000")
+
+        self.assertEqual(code, 2)
+        self.assertIn("--backups", text)
+
+    def test_a_backup_of_other_partitions_is_refused_and_changes_nothing(self):
+        self.run_cli("--enroll", str(self.box.a), "--enroll", str(self.box.b))
+        third = self.box.partition("cccccccc-0000-4000-8000-000000000003", "cccccccc-0000-4000-8000-0000000000c3")
+        write_record(self.box.a, X, title="as it was")
+        self.run_cli("--backup")
+        (only,) = self.ids()
+        write_record(self.box.a, X, at_s=LONG_AGO_S + 9, title="renamed since")
+        self.run_cli("--enroll", str(third))
+
+        code, text = self.run_cli("--restore", only, "--apply")
+
+        self.assertEqual(code, 2)
+        self.assertIn(str(third), text)
+        self.assertEqual(title_of(self.box.a, X), "renamed since")
+
+    def test_backups_and_restores_wait_for_a_run_in_flight(self):
+        only = self.renamed_since_a_backup()
+        with open(self.settings.lock_path, "a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+
+            attempts = [self.run_cli("--backup"), self.run_cli("--restore", only, "--apply")]
+
+        for code, text in attempts:
+            self.assertEqual(code, 2)
+            self.assertIn("sync is running", text)
+        self.assertEqual(self.ids(), [only])
+        self.assertEqual(title_of(self.box.a, X), "renamed since")
+
+    def test_the_first_sync_ever_takes_a_backup_by_itself_and_later_ones_do_not(self):
+        from session_sync import backups
+        self.enrol_both()
+        write_record(self.box.a, X)
+        self.run_cli()
+        self.assertEqual(self.ids(), [], "a dry run takes none")
+
+        _, text = self.run_cli("--apply")
+
+        (first,) = self.ids()
+        self.assertIn(first, text)
+        taken = backups.find(self.settings.backups_root, first)
+        self.assertEqual((taken.reason, taken.counts[1]), ("before the first sync", (str(self.box.b), 0, 0)))
+        write_record(self.box.a, Y)
+        self.run_cli("--apply")
+        self.assertEqual(self.ids(), [first])
+
+    def test_a_first_sync_that_cannot_be_backed_up_writes_nothing(self):
+        from unittest import mock
+        from session_sync.backups import BackupFailed
+        self.enrol_both()
+        write_record(self.box.a, X)
+
+        with mock.patch("session_sync.backups.take", side_effect=BackupFailed("The disk is full.")):
+            code, text = self.run_cli("--apply")
+
+        self.assertEqual(code, 2)
+        self.assertIn("The disk is full.", text)
+        self.assertIn("Nothing was changed", text)
+        self.assertEqual(list(self.box.b.iterdir()), [])
+        self.assertFalse(self.settings.state_path.exists())
+
+    def test_status_names_the_newest_backup(self):
+        self.enrol_both()
+        write_record(self.box.a, X)
+        self.assertIn("backups: none", self.run_cli("--status")[1])
+        self.run_cli("--backup")
+
+        (only,) = self.ids()
+        self.assertIn("backups: 1, newest %s" % only, self.run_cli("--status")[1])
+
+
 class Housekeeping(CliTest):
     def test_reset_state_keeps_the_old_file_aside(self):
         self.enrol_both()

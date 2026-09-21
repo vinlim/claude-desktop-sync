@@ -2,7 +2,7 @@
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 from session_sync.atomic import write_atomic
 from session_sync.model import SyncState
@@ -19,6 +19,7 @@ class StateUnusable(Exception):
 class StoredState:
     sync: SyncState = field(default_factory=SyncState)
     cache: Dict[str, Dict[str, CacheEntry]] = field(default_factory=dict)
+    logins: Dict[str, Tuple[str, int]] = field(default_factory=dict)  # see liveness.observe_logins
     reported: str = ""  # digest of the standing problems last written to the unattended log
     last_success_ms: int = 0
 
@@ -43,13 +44,15 @@ def save_state(path: Path, stored: StoredState) -> None:
 
 
 def encode_state(stored: StoredState) -> dict:
+    """The saved form. It shares nothing with the live state, so it can serve as a snapshot."""
     sync = stored.sync
     return {
         "version": VERSION,
-        "agreed": sync.agreed,
+        "agreed": dict(sync.agreed),
         "seen": {key: sorted(ids) for key, ids in sync.seen.items()},
         "placing": {key: sorted(ids) for key, ids in sync.placing.items()},
-        "placed": sync.placed,
+        "placed": {key: dict(entries) for key, entries in sync.placed.items()},
+        "logins": {root: list(seen) for root, seen in stored.logins.items()},
         "cache": {key: {sid: list(entry) for sid, entry in entries.items()} for key, entries in stored.cache.items()},
         "reported": stored.reported,
         "last_success_ms": stored.last_success_ms,
@@ -69,5 +72,6 @@ def _decode(raw: dict) -> StoredState:
                 for key, entries in raw["placed"].items()})
     cache = {key: {sid: (int(e[0]), int(e[1]), e[2], int(e[3])) for sid, e in entries.items()}
              for key, entries in raw["cache"].items()}
-    return StoredState(sync=sync, cache=cache, reported=str(raw["reported"]),
+    logins = {str(root): (str(seen[0]), int(seen[1])) for root, seen in raw["logins"].items()}
+    return StoredState(sync=sync, cache=cache, logins=logins, reported=str(raw["reported"]),
                        last_success_ms=int(raw["last_success_ms"]))

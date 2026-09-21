@@ -70,7 +70,9 @@ def scan_partition(path: Path, cache: Dict[str, CacheEntry], now_ns: int) -> Par
         if record:
             copy = _read_record(entry, record.group(1), stamp, cache, now_ns)
             if copy is not None:
-                copies[record.group(1)] = copy
+                # Activity in the future would outrank every tombstone, and the session could never
+                # be deleted. The cache keeps the time as written, so the clamp follows the clock.
+                copies[record.group(1)] = Copy(copy.state_hash, min(copy.last_activity_at, now_ns // 1_000_000))
                 result.records[record.group(1)] = stamp
                 result.cache[record.group(1)] = (stamp[0], stamp[1], copy.state_hash, copy.last_activity_at)
         elif tmp:
@@ -91,18 +93,15 @@ def _read_record(path: Path, session_id: str, stamp: Stamp, cache: Dict[str, Cac
     cached = cache.get(session_id)
     settled = now_ns - stamp[0] >= RACY_WINDOW_NS
     if cached is not None and settled and (cached[0], cached[1]) == stamp:
-        copy = Copy(state_hash=cached[2], last_activity_at=cached[3])
-    else:
-        try:
-            data = path.read_bytes()
-        except OSError:
-            return None
-        try:
-            copy = fingerprint(session_id, data)
-        except Exception:  # one odd record must never stop the run: it is unreadable (R11)
-            copy = UNREADABLE
-    # Activity in the future would outrank every tombstone, and the session could never be deleted.
-    return Copy(copy.state_hash, min(copy.last_activity_at, now_ns // 1_000_000))
+        return Copy(state_hash=cached[2], last_activity_at=cached[3])
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        return fingerprint(session_id, data)
+    except Exception:  # one odd record must never stop the run: it is unreadable (R11)
+        return UNREADABLE
 
 
 def _read_delete_time(path: Path, now_ms: int) -> Optional[int]:

@@ -153,6 +153,15 @@ class OddRecords(unittest.TestCase):
         self.assertEqual(first.snapshot.records[X].last_activity_at, NOW_MS)
         self.assertEqual(scan(self.box.a, cache=first.cache).snapshot.records[X].last_activity_at, NOW_MS)
 
+    def test_the_cache_keeps_the_time_as_written_so_the_clamp_follows_the_clock(self):
+        write_record(self.box.a, X, activity=NOW_MS + 5_000)
+        first = scan(self.box.a)
+
+        later = scan_partition(self.box.a, first.cache, now_ns=NOW_NS + 60 * SECOND_NS)
+
+        self.assertEqual(first.cache[X][3], NOW_MS + 5_000)
+        self.assertEqual(later.snapshot.records[X].last_activity_at, NOW_MS + 5_000)
+
 
 class Cache(unittest.TestCase):
     def setUp(self):

@@ -4,7 +4,7 @@ import stat
 import unittest
 
 from session_sync.model import SyncState
-from session_sync.state_store import StateUnusable, StoredState, load_state, save_state
+from session_sync.state_store import StateUnusable, StoredState, encode_state, load_state, save_state
 from tests.fs_helpers import Sandbox, X, Y
 
 
@@ -18,18 +18,34 @@ class StateStore(unittest.TestCase):
         loaded = load_state(self.path)
 
         self.assertEqual(loaded.sync, SyncState())
-        self.assertEqual((loaded.cache, loaded.reported, loaded.last_success_ms), ({}, "", 0))
+        self.assertEqual((loaded.cache, loaded.logins, loaded.reported, loaded.last_success_ms), ({}, {}, "", 0))
 
     def test_everything_survives_a_round_trip(self):
         stored = StoredState(
             sync=SyncState(agreed={X: "h1"}, seen={"/p/a": {X, Y}}, placing={"/p/b": {X}},
                            placed={"/p/b": {Y: "h2"}}),
             cache={"/p/a": {X: (12345678901234, 42, "h1", 99), Y: (5, 6, None, 0)}},
+            logins={"/data/Claude": ("aaaaaaaa-0000-4000-8000-000000000001", 777)},
             reported="digest", last_success_ms=1234)
 
         save_state(self.path, stored)
 
         self.assertEqual(load_state(self.path), stored)
+
+    def test_an_encoded_snapshot_shares_nothing_with_the_live_state(self):
+        # A run compares the state with a snapshot taken at its start to decide whether to save.
+        stored = StoredState(sync=SyncState(agreed={X: "h1"}, seen={"/p/a": {X}}, placed={"/p/b": {X: "h1"}}),
+                             cache={"/p/a": {X: (1, 2, "h1", 3)}}, logins={"/root": ("acct", 5)})
+        snapshot = encode_state(stored)
+        before = json.dumps(snapshot, sort_keys=True)
+
+        stored.sync.agreed[Y] = "h2"
+        stored.sync.seen["/p/a"].add(Y)
+        stored.sync.placed["/p/b"][Y] = "h2"
+        stored.cache["/p/a"][Y] = (4, 5, "h2", 6)
+        stored.logins["/root"] = ("other", 9)
+
+        self.assertEqual(json.dumps(snapshot, sort_keys=True), before)
 
     def test_the_file_is_private_and_written_whole(self):
         save_state(self.path, StoredState(sync=SyncState(agreed={X: "h1"})))
@@ -50,7 +66,7 @@ class StateStore(unittest.TestCase):
 
     def test_a_file_that_cannot_be_trusted_stops_the_run_and_says_how_to_recover(self):
         self.path.parent.mkdir(parents=True)
-        complete = {"version": 1, "agreed": {}, "seen": {}, "placing": {}, "placed": {}, "cache": {},
+        complete = {"version": 1, "agreed": {}, "seen": {}, "placing": {}, "placed": {}, "cache": {}, "logins": {},
                     "reported": "", "last_success_ms": 0}
         cases = {"torn": "{", "not an object": "[]", "from a newer version": json.dumps(dict(complete, version=999)),
                  "wrong shape": json.dumps(dict(complete, agreed=[]))}

@@ -50,11 +50,13 @@ class Fingerprint(unittest.TestCase):
     def test_activity_is_read_from_the_record(self):
         self.assertEqual(fingerprint(SID, record(lastActivityAt=1234)).last_activity_at, 1234)
 
-    def test_a_whole_number_written_as_a_float_is_still_a_time(self):
+    def test_a_time_written_as_a_float_is_floored(self):
+        # The app falls back to a file's mtimeMs for an imported session, and that is fractional.
         self.assertEqual(fingerprint(SID, record(lastActivityAt=1234.0)).last_activity_at, 1234)
+        self.assertEqual(fingerprint(SID, record(lastActivityAt=1234.9)).last_activity_at, 1234)
 
     def test_missing_or_odd_activity_reads_as_zero(self):
-        for value in (None, "soon", True, 1.5, -3, float("inf")):
+        for value in (None, "soon", True, -3, -0.5, float("inf"), float("nan")):
             with self.subTest(value=value):
                 self.assertEqual(fingerprint(SID, record(lastActivityAt=value)).last_activity_at, 0)
 

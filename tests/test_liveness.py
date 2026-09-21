@@ -4,11 +4,11 @@ import subprocess
 import unittest
 from types import SimpleNamespace
 
-from session_sync.liveness import APP_PROCESS, app_running, is_live, last_known_account
+from session_sync.liveness import APP_PROCESS, app_running, is_live, last_known_account, observe_logins
 from tests.fs_helpers import ACCOUNT_A, ACCOUNT_B, LONG_AGO_S, SECOND_NS, Sandbox
 
 NOW_S = LONG_AGO_S + 100_000
-NOW_NS = NOW_S * SECOND_NS
+NOW_MS = NOW_S * 1000
 
 
 def pgrep_exits(code):
@@ -95,54 +95,85 @@ class IsLive(unittest.TestCase):
     def setUp(self):
         self.box = Sandbox()
         self.addCleanup(self.box.cleanup)
+        self.root = str(self.box.root)
+
+    def live(self, partition, logins, running=True):
+        return is_live(partition, running=running, now_ms=NOW_MS, logins=logins)
+
+    def settled(self, account):
+        return {self.root: (account, NOW_MS - 10 * 60 * 1000)}
 
     def test_nothing_is_live_when_the_app_is_not_running(self):
-        self.box.logged_in_as(ACCOUNT_A, at_s=NOW_S - 1)
+        self.box.logged_in_as(ACCOUNT_A)
 
-        self.assertFalse(is_live(self.box.a, running=False, now_ns=NOW_NS))
+        self.assertFalse(self.live(self.box.a, {}, running=False))
 
-    def test_only_the_logged_in_accounts_partition_is_live(self):
+    def test_only_the_logged_in_accounts_partition_is_live_once_the_login_has_settled(self):
         self.box.logged_in_as(ACCOUNT_B)
 
-        self.assertFalse(is_live(self.box.a, running=True, now_ns=NOW_NS))
-        self.assertTrue(is_live(self.box.b, running=True, now_ns=NOW_NS))
+        self.assertFalse(self.live(self.box.a, self.settled(ACCOUNT_B)))
+        self.assertTrue(self.live(self.box.b, self.settled(ACCOUNT_B)))
+
+    def test_the_apps_frequent_config_writes_do_not_make_the_other_partition_live(self):
+        # The app rewrites its config about once a minute for reasons that have nothing to do
+        # with the login, so the file's time says nothing about a login change.
+        self.box.logged_in_as(ACCOUNT_B, at_s=NOW_S - 1)
+
+        self.assertFalse(self.live(self.box.a, self.settled(ACCOUNT_B)))
+
+    def test_a_login_change_seen_recently_makes_every_partition_live(self):
+        # F9: the login flips before the previous login's pending saves are flushed.
+        self.box.logged_in_as(ACCOUNT_B)
+
+        self.assertTrue(self.live(self.box.a, {self.root: (ACCOUNT_B, NOW_MS - 30_000)}))
+        self.assertFalse(self.live(self.box.a, {self.root: (ACCOUNT_B, NOW_MS - 121_000)}))
+
+    def test_a_login_the_tool_has_not_recorded_yet_makes_every_partition_live(self):
+        # The first run ever, or the login flipping in the middle of a run.
+        self.box.logged_in_as(ACCOUNT_B)
+
+        self.assertTrue(self.live(self.box.a, {}))
+        self.assertTrue(self.live(self.box.a, self.settled(ACCOUNT_A)))
 
     def test_an_unreadable_login_makes_every_partition_live(self):
-        self.assertTrue(is_live(self.box.a, running=True, now_ns=NOW_NS))
-        self.assertTrue(is_live(self.box.b, running=True, now_ns=NOW_NS))
-
-    def test_a_config_that_exists_but_cannot_be_parsed_makes_every_partition_live(self):
+        self.assertTrue(self.live(self.box.a, self.settled(ACCOUNT_B)))
         self.box.logged_in_as(ACCOUNT_B)
-        config = self.box.root / "config.json"
-        long_ago = os.lstat(config).st_mtime_ns
-        config.write_text("{ torn")
-        os.utime(config, ns=(long_ago, long_ago))
+        (self.box.root / "config.json").write_text("{ torn")
+        self.assertTrue(self.live(self.box.a, self.settled(ACCOUNT_B)))
 
-        self.assertTrue(is_live(self.box.a, running=True, now_ns=NOW_NS))
-
-    def test_right_after_the_app_wrote_its_config_every_partition_is_live(self):
-        # F9: the login flips before the previous login's pending saves are flushed, so for a
-        # moment the app still writes into the partition that no longer looks like its own.
-        self.box.logged_in_as(ACCOUNT_B, at_s=NOW_S - 30)
-
-        self.assertTrue(is_live(self.box.a, running=True, now_ns=NOW_NS))
-
-    def test_the_grace_period_ends(self):
-        self.box.logged_in_as(ACCOUNT_B, at_s=NOW_S - 121)
-
-        self.assertFalse(is_live(self.box.a, running=True, now_ns=NOW_NS))
-
-    def test_a_config_whose_time_cannot_be_read_makes_every_partition_live(self):
-        from unittest import mock
+    def test_a_config_write_in_flight_makes_every_partition_live(self):
+        # The app records a change in a journal first and commits the config file afterwards.
         self.box.logged_in_as(ACCOUNT_B)
+        (self.box.root / "config.json.journal").write_text("{}")
 
-        with mock.patch("session_sync.liveness.os.lstat", side_effect=PermissionError("no")):
-            self.assertTrue(is_live(self.box.a, running=True, now_ns=NOW_NS))
+        self.assertTrue(self.live(self.box.a, self.settled(ACCOUNT_B)))
 
-    def test_a_config_dated_in_the_future_is_treated_as_just_written(self):
-        self.box.logged_in_as(ACCOUNT_B, at_s=NOW_S + 500)
 
-        self.assertTrue(is_live(self.box.a, running=True, now_ns=NOW_NS))
+class ObservingTheLogin(unittest.TestCase):
+    def setUp(self):
+        self.box = Sandbox()
+        self.addCleanup(self.box.cleanup)
+        self.root = str(self.box.root)
+
+    def test_the_first_sighting_and_every_change_are_dated_now(self):
+        logins = {}
+        self.box.logged_in_as(ACCOUNT_A)
+        observe_logins([self.box.a, self.box.b], logins, now_ms=1000)
+        self.assertEqual(logins, {self.root: (ACCOUNT_A, 1000)})
+
+        observe_logins([self.box.a, self.box.b], logins, now_ms=5000)
+        self.assertEqual(logins, {self.root: (ACCOUNT_A, 1000)}, "the same login keeps its date")
+
+        self.box.logged_in_as(ACCOUNT_B)
+        observe_logins([self.box.a, self.box.b], logins, now_ms=9000)
+        self.assertEqual(logins, {self.root: (ACCOUNT_B, 9000)})
+
+    def test_an_unreadable_login_leaves_the_memory_alone(self):
+        logins = {self.root: (ACCOUNT_A, 1000)}
+
+        observe_logins([self.box.a], logins, now_ms=9000)
+
+        self.assertEqual(logins, {self.root: (ACCOUNT_A, 1000)})
 
 
 if __name__ == "__main__":

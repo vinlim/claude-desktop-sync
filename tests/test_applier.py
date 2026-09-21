@@ -174,6 +174,27 @@ class GuardTiming(ApplierTest):
         self.assertEqual(title_of(self.box.b, X), "the app made this meanwhile")
         self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
 
+    def test_being_stopped_in_the_middle_of_the_last_guard_leaves_no_staged_file(self):
+        # The guard runs pgrep, so a SIGTERM from launchd can land right there.
+        write_record(self.box.a, X, title="new")
+        write_record(self.box.b, X, title="old")
+        scans = {str(p): scan_partition(p, {}, now_ns=NOW_NS) for p in (self.box.a, self.box.b)}
+        calls = []
+
+        def stopped_on_the_second_probe(partition):
+            calls.append(partition)
+            if len(calls) == 2:
+                raise SystemExit(143)
+            return False
+
+        applier = Applier(scans, is_live=stopped_on_the_second_probe, kept_dir=self.kept)
+
+        with self.assertRaises(SystemExit):
+            applier.apply(Plan(actions=[ReplaceRecord(X, source=self.A, target=self.B, keep=False)]))
+
+        self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
+        self.assertEqual(title_of(self.box.b, X), "old")
+
     def test_a_refused_action_writes_nothing_so_a_watched_directory_does_not_refire(self):
         write_record(self.box.a, X)
         write_record(self.box.a, Y, title="new")

@@ -32,6 +32,6 @@ def _activity(value) -> int:
     # bool is an int in Python; a record holding true here is not a timestamp.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0
-    if not math.isfinite(value) or value < 0 or value != int(value):
+    if not math.isfinite(value) or value < 0:
         return 0
-    return int(value)
+    return math.floor(value)  # an imported session's time can be a file's fractional mtimeMs

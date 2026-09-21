@@ -1,5 +1,6 @@
 """Command line entry: parses arguments, takes the lock, prints the report."""
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import signal
@@ -29,6 +30,10 @@ Copies sidebar records between the enrolled per-account directories. Dry run by 
 Rules and guarantees: see DESIGN.md next to this tool."""
 
 
+class SyncBusy(Exception):
+    pass
+
+
 @dataclass
 class Environment:
     settings: Settings = field(default_factory=lambda: Settings(state_dir=DEFAULT_STATE_DIR))
@@ -39,6 +44,7 @@ class Environment:
     agent_plist: Path = agent.PLIST
     launchctl: Callable = subprocess.run
     quiet_out: Optional[TextIO] = None  # None: quiet runs append to the log file
+    lock_wait_s: float = 30.0  # how long a command that changes the sync history waits for a run to finish
 
 
 def install_sigterm_handler() -> None:
@@ -54,6 +60,8 @@ def main(argv: List[str], env: Optional[Environment] = None) -> int:
     say = _log_writer(env) if args.quiet else (lambda text: print(text, file=env.out))
 
     try:
+        if args.session and not args.prefer:
+            raise RunAborted("--session only narrows --prefer. Name the partition to prefer as well.")
         if args.enroll or args.unenroll:
             return _change_enrolment(args, env, say)
         if args.list:
@@ -71,7 +79,7 @@ def main(argv: List[str], env: Optional[Environment] = None) -> int:
             say("Removed the agent." if removed else "No agent was installed.")
             return 0
         return _run(args, env, say)
-    except (RunAborted, EnrolmentError, agent.AgentError, StateUnusable) as error:
+    except (RunAborted, EnrolmentError, agent.AgentError, StateUnusable, SyncBusy) as error:
         _say_abort(str(error), args.quiet, env, say)
         return 2
 
@@ -114,20 +122,41 @@ def _run(args, env: Environment, say) -> int:
     if args.quiet:
         agent.cap_log(env.settings.log_path)
         agent.cap_log(agent.crash_log(env.settings.log_path))
+    try:
+        with _run_lock(env, wait_s=0):
+            return _locked_run(args, env, say)
+    except SyncBusy:
+        if not args.quiet:
+            say("Another sync is running.")
+        return 0
+
+
+@contextlib.contextmanager
+def _run_lock(env: Environment, wait_s: float):
+    """One run at a time. A run saves its state at the end, so anything that edits the
+    sync history has to hold the same lock or the run would overwrite the edit."""
+    env.settings.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     with open(env.settings.lock_path, "a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            if not args.quiet:
-                say("Another sync is running.")
-            return 0
-        report = sync(env.settings, apply=args.apply, prefer=args.prefer, prefer_session=args.session,
-                      now_ns=env.now_ns, running=env.running)
-        _clear_abort_marker(env)
-        previous = _reported(env) if args.quiet else ""
-        text, digest = render(report, verbose=args.verbose, quiet=args.quiet, previous_digest=previous)
-        if args.quiet and args.apply:
-            remember_reported(env.settings, digest)
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise SyncBusy("A sync is running and did not finish in time. Nothing was changed. Try again.")
+                time.sleep(0.05)
+        yield
+
+
+def _locked_run(args, env: Environment, say) -> int:
+    report = sync(env.settings, apply=args.apply, prefer=args.prefer, prefer_session=args.session,
+                  now_ns=env.now_ns, running=env.running)
+    _clear_abort_marker(env)
+    previous = _reported(env) if args.quiet else ""
+    text, digest = render(report, verbose=args.verbose, quiet=args.quiet, previous_digest=previous)
+    if args.quiet and args.apply:
+        remember_reported(env.settings, digest)
     if text:
         say("%s\n%s" % (_timestamp(env), text) if args.quiet else text)
     return 1 if report.failures else 0
@@ -194,6 +223,11 @@ def _list(env: Environment, say) -> int:
 
 
 def _reset_state(env: Environment, say) -> int:
+    with _run_lock(env, env.lock_wait_s):
+        return _reset_state_locked(env, say)
+
+
+def _reset_state_locked(env: Environment, say) -> int:
     path = env.settings.state_path
     if not path.exists():
         say("There is no sync history to forget.")
@@ -209,7 +243,8 @@ def _reset_state(env: Environment, say) -> int:
 
 
 def _recreate(session_id: str, env: Environment, say) -> int:
-    forgotten = forget_presence(env.settings, session_id)
+    with _run_lock(env, env.lock_wait_s):
+        forgotten = forget_presence(env.settings, session_id)
     if forgotten:
         say("%s may be recreated in: %s\nRun again with --apply." % (session_id, ", ".join(forgotten)))
     else:
@@ -227,7 +262,9 @@ def _status(env: Environment, say) -> int:
     last = load_state(env.settings.state_path).last_success_ms
     age_ms = env.now_ns() // 1_000_000 - last
     say("last clean run: %s" % (_ago(age_ms) if last else "never"))
-    if installed and last and age_ms > STALE_AGENT_S * 1000:
+    if installed and not last:
+        say("The agent is installed but has never had a clean run. Check %s" % env.settings.log_path)
+    elif installed and age_ms > STALE_AGENT_S * 1000:
         say("The agent is installed but there has been no clean run for %s. Check %s"
             % (_ago(age_ms).replace(" ago", ""), env.settings.log_path))
     if len(enrolled) >= 2:

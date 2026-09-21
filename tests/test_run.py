@@ -32,6 +32,13 @@ class RunTest(unittest.TestCase):
     def names(self, directory):
         return sorted(p.name for p in directory.iterdir())
 
+    def app_running_as(self, account):
+        """The app is open under this login, and the login changed long enough ago to have settled."""
+        self.running = True
+        self.box.logged_in_as(account)
+        self.sync()
+        self.clock_s += 130
+
     def kept(self):
         root = self.settings.kept_root
         return sorted(p.name for p in root.rglob("*") if p.is_file()) if root.exists() else []
@@ -139,8 +146,7 @@ class HardSequences(RunTest):
 
     def test_a_record_removed_before_its_tombstone_is_written_is_not_put_back(self):
         self.synced()
-        self.running = True
-        self.box.logged_in_as(ACCOUNT_B)
+        self.app_running_as(ACCOUNT_B)
         (self.box.b / ("local_%s.json" % X)).unlink()
 
         report = self.sync()
@@ -198,14 +204,27 @@ class HardSequences(RunTest):
         self.assertEqual(self.names(third), ["deleted_%s" % X])
         self.assertEqual(self.names(self.box.a), ["deleted_%s" % X])
 
-    def test_forgetting_the_sync_history_does_not_bring_a_deleted_session_back_or_retire_a_live_one(self):
+    def test_forgetting_the_sync_history_does_not_retire_a_re_adopted_session(self):
         self.finished_delete()
         self.re_adopt_under_a(at_ms=NOW_MS + 60_000)
         self.settings.state_path.unlink()
 
         self.sync()
 
+        self.assertEqual(self.names(self.box.a), ["local_%s.json" % X])
         self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
+
+    def test_forgetting_the_sync_history_does_not_bring_a_deleted_session_back(self):
+        # The delete had reached only one side when the history was forgotten.
+        self.synced()
+        (self.box.b / ("local_%s.json" % X)).unlink()
+        write_tombstone(self.box.b, X, deleted_at_ms=NOW_MS)
+        self.settings.state_path.unlink()
+
+        self.sync()
+
+        self.assertEqual(self.names(self.box.a), ["deleted_%s" % X])
+        self.assertEqual(self.names(self.box.b), ["deleted_%s" % X])
 
     def test_prefer_settles_a_tie(self):
         self.synced()
@@ -227,8 +246,7 @@ class ThreePartitions(RunTest):
         enrol(self.settings.config_path, third)
         write_record(self.box.a, X, activity=100, title="v0")
         self.sync()
-        self.running = True
-        self.box.logged_in_as("cccccccc-0000-4000-8000-000000000003")
+        self.app_running_as("cccccccc-0000-4000-8000-000000000003")
         write_record(self.box.a, X, at_s=LONG_AGO_S + 50, activity=500, title="first change")
         self.sync()
         self.assertEqual(title_of(self.box.b, X), "first change")
@@ -257,6 +275,64 @@ class OrphanedTempFiles(RunTest):
 
         self.assertEqual(self.names(self.box.a), ["deleted_%s" % X])
         self.assertEqual(self.kept(), ["local_%s.json.tmp" % X])
+
+
+class LoginChanges(RunTest):
+    """R9. The numbers in the cadence test are the ones measured on a real install."""
+
+    def test_work_reaches_the_other_partition_while_the_app_keeps_rewriting_its_config(self):
+        write_record(self.box.a, X, activity=100, title="agreed")
+        self.sync()
+        self.app_running_as(ACCOUNT_B)
+
+        for minute in range(1, 6):
+            self.box.logged_in_as(ACCOUNT_B, at_s=self.clock_s)  # the app's own unrelated config write
+            write_record(self.box.b, X, at_s=LONG_AGO_S + minute, activity=100 + minute, title="turn %d" % minute)
+            self.clock_s += 50
+            self.sync()
+
+            self.assertEqual(title_of(self.box.a, X), "turn %d" % minute)
+
+    def test_nothing_is_changed_anywhere_for_a_while_after_a_login_change_is_first_seen(self):
+        write_record(self.box.a, X, activity=100, title="agreed")
+        self.sync()
+        self.app_running_as(ACCOUNT_A)
+        write_record(self.box.a, X, at_s=LONG_AGO_S + 50, activity=500, title="last work under A")
+        self.box.logged_in_as(ACCOUNT_B)  # the switch: A may still be flushing pending saves
+
+        during = self.sync()
+        self.assertEqual(title_of(self.box.b, X), "agreed")
+        self.assertEqual({(p.kind, p.partition) for p in during.problems}, {("live", str(self.box.b))})
+
+        self.clock_s += 130
+        self.sync()
+        self.assertEqual(title_of(self.box.b, X), "agreed", "B is the login now, so it waits for B to go idle")
+        self.assertEqual(title_of(self.box.a, X), "last work under A")
+
+    def test_the_first_run_ever_treats_the_login_as_just_changed(self):
+        write_record(self.box.a, X, activity=100, title="older")
+        write_record(self.box.b, X, activity=900, title="newer")
+        self.running = True
+        self.box.logged_in_as(ACCOUNT_B)
+
+        first = self.sync()
+        self.assertEqual(title_of(self.box.a, X), "older")
+        self.assertIn(("live", str(self.box.a)), {(p.kind, p.partition) for p in first.problems})
+
+        self.clock_s += 130
+        self.sync()
+        self.assertEqual(title_of(self.box.a, X), "newer")
+
+    def test_a_dry_run_sees_a_login_change_without_recording_it(self):
+        write_record(self.box.a, X)
+        self.sync()
+        self.app_running_as(ACCOUNT_A)
+        self.box.logged_in_as(ACCOUNT_B)
+        before = self.settings.state_path.read_bytes()
+
+        self.sync(apply=False)
+
+        self.assertEqual(self.settings.state_path.read_bytes(), before)
 
 
 class LivePartitions(RunTest):
@@ -329,13 +405,14 @@ class SafetyNets(RunTest):
         self.assertIn("--reset-state", str(raised.exception))
         self.assertEqual(self.names(self.box.b), [])
 
-    def test_intents_are_on_disk_before_the_first_write(self):
+    def test_an_intent_is_on_disk_before_its_create(self):
+        from session_sync.intent_log import IntentLog
         write_record(self.box.a, X)
-        with mock.patch("session_sync.run.Applier.apply", side_effect=KeyboardInterrupt):
+        with mock.patch("session_sync.applier.commit_create", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 self.sync()
 
-        self.assertEqual(load_state(self.settings.state_path).sync.placing, {str(self.box.b): {X}})
+        self.assertEqual(IntentLog(self.settings.intent_log_path).read(), {str(self.box.b): {X}})
 
     def test_an_unenrolled_partition_with_records_is_reported_and_untouched(self):
         third = self.box.partition("cccccccc-0000-4000-8000-000000000003", "cccccccc-0000-4000-8000-0000000000c3")
@@ -385,6 +462,46 @@ class SafetyNets(RunTest):
 
         self.assertEqual(sorted(p.name for p in self.settings.kept_root.iterdir()),
                          ["20260102-000000", "20260103-000000"], "the oldest run goes first")
+
+    def test_the_size_cap_never_removes_what_this_very_run_kept(self):
+        import session_sync.run as module
+        write_record(self.box.a, X, activity=100, title="agreed")
+        self.sync()
+        write_record(self.box.a, X, at_s=LONG_AGO_S + 50, activity=500, title="work under A")
+        write_record(self.box.b, X, at_s=LONG_AGO_S + 60, activity=900, title="later work under B")
+
+        with mock.patch.object(module, "KEPT_MAX_BYTES", 1):
+            report = self.sync()
+
+        kept = [outcome.kept for outcome in report.done if outcome.kept]
+        self.assertEqual(len(kept), 1)
+        self.assertTrue(kept[0].exists(), "the report names this path, so it must still be there")
+
+    def test_a_run_stopped_in_the_middle_holds_back_only_the_create_that_was_in_flight(self):
+        import session_sync.applier as module
+        Z = "33333333-3333-4333-8333-333333333333"
+        for sid in (X, Y, Z):
+            write_record(self.box.a, sid)
+        real = module.commit_create
+        creates = []
+
+        def stopped_during_the_second_create(temporary, destination):
+            creates.append(destination)
+            if len(creates) == 2:
+                raise KeyboardInterrupt
+            real(temporary, destination)
+
+        with mock.patch.object(module, "commit_create", stopped_during_the_second_create):
+            with self.assertRaises(KeyboardInterrupt):
+                self.sync()
+        self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
+
+        after = self.sync()
+
+        self.assertEqual(self.names(self.box.b), ["local_%s.json" % X, "local_%s.json" % Z])
+        self.assertEqual([(p.kind, p.session_id) for p in after.problems], [("lost", Y)])
+        self.sync()
+        self.assertEqual(len(self.names(self.box.b)), 3, "the held create goes through one run later")
 
     def test_stale_temp_files_are_swept_from_the_tools_own_folders_too(self):
         self.settings.kept_root.mkdir(parents=True)

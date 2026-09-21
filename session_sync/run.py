@@ -9,10 +9,11 @@ from typing import Callable, Dict, List, Optional
 
 from session_sync.applier import Applier, Outcome
 from session_sync.atomic import TEMP_PREFIX, TEMP_SUFFIX
+from session_sync.intent_log import IntentLog
 from session_sync.enrolment import (EnrolmentError, load_enrolled, reject_same_directory_twice,
                                     unenrolled_with_records, validate_partition)
-from session_sync.liveness import app_running, is_live
-from session_sync.model import Action, CreateRecord, Plan, Problem, ReplaceRecord
+from session_sync.liveness import app_running, is_live, observe_logins
+from session_sync.model import Action, CreateRecord, Problem, ReplaceRecord
 from session_sync.planner import plan
 from session_sync.scanner import PartitionScan, scan_partition, stamp_of
 from session_sync.settle import settle
@@ -47,6 +48,10 @@ class Settings:
     @property
     def log_path(self) -> Path:
         return self.state_dir / "agent.log"
+
+    @property
+    def intent_log_path(self) -> Path:
+        return self.state_dir / "placing.log"
 
 
 class RunAborted(Exception):
@@ -88,13 +93,17 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
     partitions = _enrolled_or_abort(settings)
     stored = _state_or_abort(settings)
     on_disk = encode_state(stored)
+    intents = IntentLog(settings.intent_log_path)
+    for partition, session_ids in intents.read().items():  # left by a run that did not finish
+        stored.sync.placing.setdefault(partition, set()).update(session_ids)
     if apply:
         _sweep_stale_temps(partitions + [settings.state_dir], now_ns())
         _sweep_stale_temps(_folders_under(settings.kept_root), now_ns())
 
     scans = _scan(partitions, stored.cache, now_ns())
     app_is_running = running()
-    live = {str(p) for p in partitions if is_live(p, app_is_running, now_ns())}
+    observe_logins(partitions, stored.logins, now_ns() // 1_000_000)
+    live = {str(p) for p in partitions if is_live(p, app_is_running, now_ns() // 1_000_000, stored.logins)}
     the_plan = plan([scan.snapshot for scan in scans.values()], stored.sync, live,
                     _resolve_prefer(prefer, partitions), prefer_session)
     report = RunReport(
@@ -106,11 +115,9 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
     if not apply:
         return report
 
-    if _journal_intents(stored, the_plan):
-        save_state(settings.state_path, stored)
-        on_disk = encode_state(stored)
     kept_dir = settings.kept_root / time.strftime("%Y%m%d-%H%M%S", time.localtime(now_ns() // 1_000_000_000))
-    applier = Applier(scans, is_live=lambda partition: is_live(partition, running(), now_ns()), kept_dir=kept_dir)
+    applier = Applier(scans, kept_dir=kept_dir, before_create=intents.record, is_live=lambda partition: is_live(
+        partition, running(), now_ns() // 1_000_000, stored.logins))
     report.outcomes = applier.apply(the_plan)
     _remember_placements(stored, report.done, scans)
 
@@ -118,8 +125,9 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
     stored.sync = settle(stored.sync, [scan.snapshot for scan in fresh.values()])
     stored.cache = {key: scan.cache for key, scan in fresh.items()}
     if not report.failures:
-        _prune_kept(settings.kept_root, now_ns())
+        _prune_kept(settings.kept_root, now_ns(), never=kept_dir)
     _save_if_worth_it(settings, stored, on_disk, clean=not report.failures, now_ms=now_ns() // 1_000_000)
+    intents.clear()
     return report
 
 
@@ -200,15 +208,6 @@ def _resolve_prefer(prefer: Optional[str], partitions: List[Path]) -> Optional[s
     raise RunAborted("--prefer %s names no enrolled partition. Use a path or label shown by --list." % prefer)
 
 
-def _journal_intents(stored: StoredState, the_plan: Plan) -> bool:
-    """R7, R10: if this run dies after creating a record, the next run must know the
-    record was there, or it would put back one the app removed in between."""
-    intents = [action for action in the_plan.actions if isinstance(action, CreateRecord)]
-    for action in intents:
-        stored.sync.placing.setdefault(action.target, set()).add(action.session_id)
-    return bool(intents)
-
-
 def _sweep_stale_temps(folders: List[Path], now: int) -> None:
     """A killed run can leave a staged file behind. Anything this old belongs to no running sync."""
     for folder in folders:
@@ -231,11 +230,12 @@ def _folders_under(root: Path) -> List[Path]:
     return [Path(folder) for folder, _, _ in os.walk(root)]
 
 
-def _prune_kept(kept_root: Path, now: int) -> None:
-    """Kept copies are bounded by age and by total size, oldest run first."""
+def _prune_kept(kept_root: Path, now: int, never: Path) -> None:
+    """Kept copies are bounded by age and by total size, oldest run first. The run that just
+    finished is never touched: its report names those paths."""
     try:
         runs = sorted((os.lstat(run).st_mtime_ns, run) for run in kept_root.iterdir()
-                      if run.is_dir() and not run.is_symlink())
+                      if run.is_dir() and not run.is_symlink() and run != never)
     except OSError:
         return
     sizes = {run: _size_of(run) for _, run in runs}

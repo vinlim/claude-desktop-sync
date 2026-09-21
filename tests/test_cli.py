@@ -37,7 +37,7 @@ class CliTest(unittest.TestCase):
         out = io.StringIO()
         env = Environment(settings=self.settings, out=out, now_ns=lambda: self.clock_s * SECOND_NS,
                           running=lambda: self.running, sessions_dir=self.box.root / "claude-code-sessions",
-                          agent_plist=self.plist, launchctl=self.launchctl, quiet_out=out)
+                          agent_plist=self.plist, launchctl=self.launchctl, quiet_out=out, lock_wait_s=0.2)
         return main(list(argv), env), out.getvalue()
 
     def enrol_both(self):
@@ -166,6 +166,31 @@ class StandingProblems(CliTest):
         self.assertIn(X, text)
         self.assertEqual(title_of(self.box.b, X), "t")
 
+    def test_session_without_prefer_is_refused_instead_of_being_ignored(self):
+        self.enrol_both()
+
+        code, text = self.run_cli("--apply", "--session", X)
+
+        self.assertEqual(code, 2)
+        self.assertIn("--prefer", text)
+
+    def test_changing_the_sync_history_waits_for_a_run_in_flight_and_gives_up_politely(self):
+        # A run saves its state at the end and would overwrite the change.
+        self.enrol_both()
+        write_record(self.box.a, X)
+        self.run_cli("--apply")
+        before = self.settings.state_path.read_bytes()
+        with open(self.settings.lock_path, "a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+
+            recreate = self.run_cli("--recreate", X)
+            reset = self.run_cli("--reset-state")
+
+        for code, text in (recreate, reset):
+            self.assertEqual(code, 2)
+            self.assertIn("sync is running", text)
+        self.assertEqual(self.settings.state_path.read_bytes(), before)
+
     def test_prefer_can_settle_one_session_and_leave_the_other_tied(self):
         self.enrol_both()
         for sid in (X, Y):
@@ -216,6 +241,15 @@ class AgentUpkeep(CliTest):
         self.agent_is_loaded = False
 
         self.assertIn("installed but not loaded", self.run_cli("--status")[1])
+
+    def test_status_warns_about_an_installed_agent_that_has_never_had_a_clean_run(self):
+        self.enrol_both()
+        self.pretend_the_agent_is_installed()
+
+        text = self.run_cli("--status")[1]
+
+        self.assertIn("last clean run: never", text)
+        self.assertIn("has never had a clean run", text)
 
     def test_status_warns_when_an_installed_agent_has_not_had_a_clean_run_for_a_while(self):
         self.enrol_both()

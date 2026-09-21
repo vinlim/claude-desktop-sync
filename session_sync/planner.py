@@ -37,9 +37,13 @@ def _plan_session(session_id: str, snapshots: List[Snapshot], state: SyncState, 
         return
 
     if holders and _used_after_delete(session_id, holders, entombed):
-        _plan_record(session_id, snapshots, holders, state, live, prefer, result, absence_explained=True)
-        for snapshot in entombed:
-            _unless_live(snapshot, session_id, live, result, RetireTombstone(session_id, target=snapshot.key))
+        version_chosen = _plan_record(session_id, snapshots, holders, state, live, prefer, result,
+                                      absence_explained=True)
+        # With the copies tied, nothing can be put back. The tombstone stays, or the partition
+        # that deleted would read as having lost the record (R7) and never get it again.
+        if version_chosen:
+            for snapshot in entombed:
+                _unless_live(snapshot, session_id, live, result, RetireTombstone(session_id, target=snapshot.key))
         return
 
     _plan_delete(session_id, snapshots, entombed[0], live, result)
@@ -74,12 +78,13 @@ def _unless_live(snapshot: Snapshot, session_id: str, live: Set[str], result: Pl
 
 
 def _plan_record(session_id: str, snapshots: List[Snapshot], holders: List[Snapshot], state: SyncState,
-                 live: Set[str], prefer: Optional[str], result: Plan, absence_explained: bool) -> None:
+                 live: Set[str], prefer: Optional[str], result: Plan, absence_explained: bool) -> bool:
+    """Returns whether a version was chosen."""
     untouched = [s for s in holders if _still_as_synced(s, session_id, state)]
     winner = _one_sided_winner(session_id, holders, untouched) or _latest_activity_winner(session_id, holders, prefer)
     if winner is None:  # R4: a tie nobody settled
         result.problems.extend(Problem("tied", session_id, s.key) for s in _most_active(session_id, holders))
-        return
+        return False
 
     winning = winner.records[session_id]
     for target in holders:
@@ -97,6 +102,7 @@ def _plan_record(session_id: str, snapshots: List[Snapshot], holders: List[Snaps
             result.problems.append(Problem("lost", session_id, target.key))
             continue
         result.actions.append(CreateRecord(session_id, source=winner.key, target=target.key))  # R5
+    return True
 
 
 def _still_as_synced(snapshot: Snapshot, session_id: str, state: SyncState) -> bool:

@@ -24,10 +24,12 @@ class Refused(Exception):
 
 
 class Applier:
-    def __init__(self, scans: Dict[str, PartitionScan], is_live: Callable[[Path], bool], kept_dir: Path) -> None:
+    def __init__(self, scans: Dict[str, PartitionScan], is_live: Callable[[Path], bool], kept_dir: Path,
+                 before_create: Callable[[str, str], None] = lambda partition, session_id: None) -> None:
         self.scans = scans
         self.is_live = is_live
         self.kept_dir = kept_dir
+        self.before_create = before_create  # told (partition, session id) just before a record is created
         self.handlers = {
             CreateRecord: self._create_record,
             ReplaceRecord: self._replace_record,
@@ -63,8 +65,11 @@ class Applier:
 
     def _create_record(self, action: CreateRecord) -> None:
         data, mtime_ns = self._read_planned_record(action.source, action.session_id)
-        self._create(record_path(Path(action.target), action.session_id), data, mtime_ns,
-                     "a file appeared at the target since the scan")
+        target = record_path(Path(action.target), action.session_id)
+        if os.path.lexists(target):
+            raise Refused("a file appeared at the target since the scan")
+        self.before_create(action.target, action.session_id)
+        self._create(target, data, mtime_ns, "a file appeared at the target since the scan")
 
     def _replace_record(self, action: ReplaceRecord) -> Optional[Path]:
         data, mtime_ns = self._read_planned_record(action.source, action.session_id)
@@ -76,7 +81,7 @@ class Applier:
         staged = stage(path, data, mtime_ns)
         try:
             self._guard_existing(partition, path, scanned)  # after the slow write, right before the rename
-        except Refused:
+        except BaseException:  # a refusal, or being stopped while the guard probes for the app
             discard(staged)
             raise
         commit_replace(staged, path)
@@ -126,10 +131,14 @@ class Applier:
         """Checks first so a standing refusal writes nothing: a watched directory would refire on it."""
         if os.path.lexists(target):
             raise Refused(refusal)
+        staged = stage(target, data, mtime_ns)
         try:
-            commit_create(stage(target, data, mtime_ns), target)
+            commit_create(staged, target)
         except FileExistsError:
             raise Refused(refusal)
+        except BaseException:  # stopped between staging and linking
+            discard(staged)
+            raise
 
     def _read_planned_record(self, source_key: str, session_id: str) -> Tuple[bytes, int]:
         """The bytes of exactly the version the planner chose (R2)."""

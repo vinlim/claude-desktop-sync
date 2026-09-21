@@ -90,6 +90,16 @@ class RecordWins(unittest.TestCase):
         self.assertEqual(result.actions, [CreateRecord(X, source="A", target="B")])
         self.assertEqual(result.problems, [Problem("live", X, "B")])
 
+    def test_a_tie_among_the_surviving_copies_does_not_cost_the_deleting_partition_its_tombstone(self):
+        # Without a chosen version nothing can be put back, so the tombstone has to stay:
+        # with it gone, the partition that deleted would read as having lost the record.
+        result = planned([snapshot("A", {X: copy("v2", activity=DELETED_AT + 5)}),
+                          snapshot("B", {X: copy("v3", activity=DELETED_AT + 5)}),
+                          snapshot("C", tombstones={X: DELETED_AT})], state(agreed={X: "v1"}))
+
+        self.assertEqual(result.actions, [])
+        self.assertEqual({p.kind for p in result.problems}, {"tied"})
+
     def test_differing_copies_still_converge_when_the_record_wins(self):
         result = planned([snapshot("A", {X: copy("v2", activity=DELETED_AT + 5), }, tombstones={X: DELETED_AT}),
                           snapshot("B", {X: copy("v1", activity=DELETED_AT - 5)})], state(agreed={X: "v1"}))

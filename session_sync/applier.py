@@ -27,14 +27,14 @@ class Refused(Exception):
 
 class Applier:
     def __init__(self, scans: Dict[str, PartitionScan], is_live: Callable[[Path], bool], kept_dir: Path,
-                 before_create: Callable[[str, str], None] = lambda partition, session_id: None,
-                 after_create: Callable[[str, str], None] = lambda partition, session_id: None) -> None:
+                 on_created: Callable[[str, str], None] = lambda partition, session_id: None) -> None:
         self.scans = scans
         self.is_live = is_live
         self.kept_dir = kept_dir
-        # Both are told (partition, session id): one just before a record is created, one once it exists.
-        self.before_create = before_create
-        self.after_create = after_create
+        # Told (partition, session id) once a record exists, to write that down. If it raises,
+        # the create is undone: presence nobody recorded would let a later run put back a
+        # record the app removed (R7).
+        self.on_created = on_created
         self.handlers = {
             CreateRecord: self._create_record,
             ReplaceRecord: self._replace_record,
@@ -73,10 +73,13 @@ class Applier:
         target = record_path(Path(action.target), action.session_id)
         if os.path.lexists(target):
             raise Refused("a file appeared at the target since the scan")
-        self.before_create(action.target, action.session_id)
         with _stop_signals_held_back():
             self._create(target, data, mtime_ns, "a file appeared at the target since the scan")
-            self.after_create(action.target, action.session_id)
+            try:
+                self.on_created(action.target, action.session_id)
+            except BaseException as error:
+                self._undo_create(target, error)
+                raise
 
     def _replace_record(self, action: ReplaceRecord) -> Optional[Path]:
         data, mtime_ns = self._read_planned_record(action.source, action.session_id)
@@ -133,6 +136,15 @@ class Applier:
                             self.scans[action.target].tombstones.get(action.session_id))
 
     # -- shared steps ----------------------------------------------------------
+
+    def _undo_create(self, target: Path, why: BaseException) -> None:
+        """The file is ours alone: it was linked a moment ago under a name that was free, and
+        the app has not had a login initialise since."""
+        try:
+            os.unlink(target)
+        except OSError as error:
+            raise Refused("the record was created but could be neither recorded nor undone (%s: %s, then %s: %s)"
+                          % (type(why).__name__, why, type(error).__name__, error))
 
     def _create(self, target: Path, data: bytes, mtime_ns: int, refusal: str) -> None:
         """Checks first so a standing refusal writes nothing: a watched directory would refire on it."""
@@ -192,8 +204,8 @@ class Applier:
 
 @contextlib.contextmanager
 def _stop_signals_held_back():
-    """A create and the journal line that proves it belong together. A stop signal that landed
-    between the two would leave a completed create looking as if it may never have happened."""
+    """A create and the writing down of it belong together. A stop signal that landed between
+    the two would leave a record nobody recorded."""
     held = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
     try:
         yield

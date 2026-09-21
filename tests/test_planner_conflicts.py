@@ -143,18 +143,6 @@ class LostRecords(unittest.TestCase):
         self.assertEqual(result.actions, [])
         self.assertEqual(result.problems, [Problem("lost", X, "B")])
 
-    def test_a_create_that_may_or_may_not_have_happened_is_held_back_and_says_so(self):
-        # Journalled by a run that did not finish, with no sign that it completed.
-        result = planned([snapshot("A", {X: copy("v1")}), snapshot("B")], state(placing={"B": {X}}))
-
-        self.assertEqual(result.actions, [])
-        self.assertEqual(result.problems, [Problem("held", X, "B")])
-
-    def test_seen_outranks_held(self):
-        result = planned([snapshot("A", {X: copy("v1")}), snapshot("B")],
-                         state(seen={"B": {X}}, placing={"B": {X}}))
-
-        self.assertEqual(result.problems, [Problem("lost", X, "B")])
 
     def test_a_loss_in_one_partition_does_not_stop_creation_in_another(self):
         result = planned([snapshot("A", {X: copy("v1")}), snapshot("B"), snapshot("C")],

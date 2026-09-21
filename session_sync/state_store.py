@@ -50,7 +50,6 @@ def encode_state(stored: StoredState) -> dict:
         "version": VERSION,
         "agreed": dict(sync.agreed),
         "seen": {key: sorted(ids) for key, ids in sync.seen.items()},
-        "placing": {key: sorted(ids) for key, ids in sync.placing.items()},
         "placed": {key: dict(entries) for key, entries in sync.placed.items()},
         "logins": {root: list(seen) for root, seen in stored.logins.items()},
         "cache": {key: {sid: list(entry) for sid, entry in entries.items()} for key, entries in stored.cache.items()},
@@ -67,7 +66,6 @@ def _decode(raw: dict) -> StoredState:
     sync = SyncState(
         agreed={str(sid): str(value) for sid, value in raw["agreed"].items()},
         seen={key: set(ids) for key, ids in raw["seen"].items()},
-        placing={key: set(ids) for key, ids in raw["placing"].items()},
         placed={key: {str(sid): str(value) for sid, value in entries.items()}
                 for key, entries in raw["placed"].items()})
     cache = {key: {sid: (int(e[0]), int(e[1]), e[2], int(e[3])) for sid, e in entries.items()}

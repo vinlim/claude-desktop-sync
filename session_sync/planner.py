@@ -103,9 +103,6 @@ def _plan_record(session_id: str, snapshots: List[Snapshot], holders: List[Snaps
         if not absence_explained and session_id in state.seen.get(target.key, ()):  # R7: it was here
             result.problems.append(Problem("lost", session_id, target.key))
             continue
-        if not absence_explained and session_id in state.placing.get(target.key, ()):  # R7: it may have been
-            result.problems.append(Problem("held", session_id, target.key))
-            continue
         result.actions.append(CreateRecord(session_id, source=winner.key, target=target.key))  # R5
     return True
 

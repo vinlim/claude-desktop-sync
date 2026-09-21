@@ -36,8 +36,7 @@ class SyncState:
     """What the tool remembers between runs (DESIGN.md, Model)."""
 
     agreed: Dict[str, str] = field(default_factory=dict)
-    seen: Dict[str, Set[str]] = field(default_factory=dict)
-    placing: Dict[str, Set[str]] = field(default_factory=dict)
+    seen: Dict[str, Set[str]] = field(default_factory=dict)  # the one record of what was ever in a partition (R7)
     placed: Dict[str, Dict[str, str]] = field(default_factory=dict)  # partition -> id -> hash the tool put there
 
 
@@ -86,7 +85,7 @@ Action = Union[CreateRecord, ReplaceRecord, RetireRecord, RetireTmp, CreateTombs
 
 @dataclass(frozen=True)
 class Problem:
-    """Something left alone on purpose. kind: live, tied, lost, held, unreadable or future."""
+    """Something left alone on purpose. kind: live, tied, lost, unreadable or future."""
 
     kind: str
     session_id: str

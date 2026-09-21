@@ -191,6 +191,25 @@ class StandingProblems(CliTest):
             self.assertIn("sync is running", text)
         self.assertEqual(self.settings.state_path.read_bytes(), before)
 
+    def test_recreate_works_straight_after_a_run_that_did_not_finish(self):
+        # dry run, --recreate, --apply, with no applied run in between.
+        from unittest import mock
+        self.enrol_both()
+        write_record(self.box.a, Y)
+        self.run_cli("--apply")
+        write_record(self.box.b, X)
+        with mock.patch("session_sync.run._remember_placements", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_cli("--apply")
+        (self.box.a / ("local_%s.json" % X)).unlink()
+        self.assertIn("not recreated", self.run_cli()[1])
+
+        code, _ = self.run_cli("--recreate", X)
+        self.run_cli("--apply")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(title_of(self.box.a, X), "t")
+
     def test_prefer_can_settle_one_session_and_leave_the_other_tied(self):
         self.enrol_both()
         for sid in (X, Y):

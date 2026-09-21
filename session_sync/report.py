@@ -14,8 +14,6 @@ EXPLANATIONS = {
     "tied": "both copies changed with no new activity on either. Choose one with --prefer PARTITION",
     "lost": "was here before and is gone without a delete marker, so it is not recreated here. "
             "--recreate ID lifts that",
-    "held": "a run that did not finish may have created this record here. It is held back for this run and "
-            "created on the next, unless a delete marker turns up",
     "unreadable": "this copy cannot be read or is not a valid session record, so nothing is done for this session",
     "future": "this copy's last activity is dated in the future, so it cannot be ordered against a delete or "
               "another copy. Nothing is done for this session until the clock catches up. Using the session, or "

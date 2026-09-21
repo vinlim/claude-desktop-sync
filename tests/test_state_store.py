@@ -22,8 +22,7 @@ class StateStore(unittest.TestCase):
 
     def test_everything_survives_a_round_trip(self):
         stored = StoredState(
-            sync=SyncState(agreed={X: "h1"}, seen={"/p/a": {X, Y}}, placing={"/p/b": {X}},
-                           placed={"/p/b": {Y: "h2"}}),
+            sync=SyncState(agreed={X: "h1"}, seen={"/p/a": {X, Y}}, placed={"/p/b": {Y: "h2"}}),
             cache={"/p/a": {X: (12345678901234, 42, "h1", 99), Y: (5, 6, None, 0)}},
             logins={"/data/Claude": ("aaaaaaaa-0000-4000-8000-000000000001", 777)},
             reported="digest", last_success_ms=1234)
@@ -66,7 +65,7 @@ class StateStore(unittest.TestCase):
 
     def test_a_file_that_cannot_be_trusted_stops_the_run_and_says_how_to_recover(self):
         self.path.parent.mkdir(parents=True)
-        complete = {"version": 1, "agreed": {}, "seen": {}, "placing": {}, "placed": {}, "cache": {}, "logins": {},
+        complete = {"version": 1, "agreed": {}, "seen": {}, "placed": {}, "cache": {}, "logins": {},
                     "reported": "", "last_success_ms": 0}
         cases = {"torn": "{", "not an object": "[]", "from a newer version": json.dumps(dict(complete, version=999)),
                  "wrong shape": json.dumps(dict(complete, agreed=[]))}

@@ -295,7 +295,7 @@ class PresenceSeenDuringARun(RunTest):
 
 
 class CreatesOfARunThatDidNotFinish(RunTest):
-    """R7: a create that is known to have completed counts as present, whatever happened to the run."""
+    """R7: a create is written down the moment it completes, whatever then happens to the run."""
 
     def a_run_creates_x_in_a_and_then(self, fails_with, at):
         write_record(self.box.a, Y)
@@ -339,14 +339,72 @@ class CreatesOfARunThatDidNotFinish(RunTest):
 
         self.assert_never_created_again()
 
-    def test_recreate_still_lifts_the_hold(self):
+    def test_recreate_lifts_the_hold_with_no_run_in_between(self):
+        # Straight after the run that did not finish: nothing else may still claim the record was there.
         from session_sync.run import forget_presence
         self.a_run_creates_x_in_a_and_then(KeyboardInterrupt, at="session_sync.run._remember_placements")
-        self.sync()
+        self.assertIn(("lost", X), {(p.kind, p.session_id) for p in self.sync(apply=False).problems})
 
         forget_presence(self.settings, X)
         self.sync()
 
+        self.assertIn("local_%s.json" % X, self.names(self.box.a))
+
+    def test_forgetting_the_sync_history_forgets_such_a_create_too(self):
+        self.a_run_creates_x_in_a_and_then(KeyboardInterrupt, at="session_sync.run._remember_placements")
+        self.settings.state_path.unlink()
+
+        self.sync()
+
+        self.assertIn("local_%s.json" % X, self.names(self.box.a), "first contact again: a missing record is copied")
+
+    def test_a_failed_save_does_not_erase_what_was_already_known(self):
+        # X was under B before, was deleted there, and was then used under A, so it goes back to B.
+        # If writing that down fails, B's earlier presence must survive the undo.
+        import session_sync.run as module
+        write_record(self.box.a, X, activity=100)
+        self.sync()
+        (self.box.b / ("local_%s.json" % X)).unlink()
+        write_tombstone(self.box.b, X, deleted_at_ms=self.clock_s * 1000)
+        self.clock_s += 60
+        write_record(self.box.a, X, at_s=LONG_AGO_S + 50, activity=self.clock_s * 1000, title="used after the delete")
+        real = module.save_state
+        saves = []
+
+        def the_save_after_the_create_fails(path, stored):
+            saves.append(1)
+            if len(saves) == 1:
+                raise PermissionError("state.json")
+            real(path, stored)
+
+        with mock.patch.object(module, "save_state", the_save_after_the_create_fails):
+            self.sync()
+
+        self.assertNotIn("local_%s.json" % X, self.names(self.box.b))
+        self.assertIn(X, load_state(self.settings.state_path).sync.seen[str(self.box.b)])
+
+    def test_a_create_that_cannot_be_written_down_is_undone_and_tried_again_later(self):
+        import session_sync.run as module
+        write_record(self.box.a, Y)
+        self.sync()
+        write_record(self.box.b, X)
+        real = module.save_state
+        saves = []
+
+        def the_save_after_the_create_fails(path, stored):
+            saves.append(1)
+            if len(saves) == 2:  # the first is what the run saw, the second follows the create
+                raise PermissionError("state.json")
+            real(path, stored)
+
+        with mock.patch.object(module, "save_state", the_save_after_the_create_fails):
+            report = self.sync()
+
+        self.assertIn("PermissionError", report.failures[0].problem)
+        self.assertNotIn("local_%s.json" % X, self.names(self.box.a), "undone, so there is nothing to remember")
+        self.assertNotIn(X, load_state(self.settings.state_path).sync.seen[str(self.box.a)])
+
+        self.sync()
         self.assertIn("local_%s.json" % X, self.names(self.box.a))
 
 
@@ -595,16 +653,6 @@ class SafetyNets(RunTest):
         self.assertIn("--reset-state", str(raised.exception))
         self.assertEqual(self.names(self.box.b), [])
 
-    def test_an_intent_is_on_disk_before_its_create(self):
-        from session_sync.intent_log import IntentLog
-        write_record(self.box.a, X)
-        with mock.patch("session_sync.applier.commit_create", side_effect=KeyboardInterrupt):
-            with self.assertRaises(KeyboardInterrupt):
-                self.sync()
-
-        journal = IntentLog(self.settings.intent_log_path).read()
-        self.assertEqual((journal.pending, journal.completed), ({str(self.box.b): {X}}, {}))
-
     def test_an_unenrolled_partition_with_records_is_reported_and_untouched(self):
         third = self.box.partition("cccccccc-0000-4000-8000-000000000003", "cccccccc-0000-4000-8000-0000000000c3")
         write_record(third, Y)
@@ -668,7 +716,7 @@ class SafetyNets(RunTest):
         self.assertEqual(len(kept), 1)
         self.assertTrue(kept[0].exists(), "the report names this path, so it must still be there")
 
-    def test_a_run_stopped_in_the_middle_holds_back_only_the_create_that_was_in_flight(self):
+    def test_a_run_stopped_in_the_middle_leaves_nothing_half_done_and_the_next_run_finishes(self):
         import session_sync.applier as module
         Z = "33333333-3333-4333-8333-333333333333"
         for sid in (X, Y, Z):
@@ -687,12 +735,13 @@ class SafetyNets(RunTest):
                 self.sync()
         self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
 
+        self.assertEqual(load_state(self.settings.state_path).sync.seen[str(self.box.b)], {X},
+                         "only the create that completed was written down")
+
         after = self.sync()
 
-        self.assertEqual(self.names(self.box.b), ["local_%s.json" % X, "local_%s.json" % Z])
-        self.assertEqual([(p.kind, p.session_id) for p in after.problems], [("held", Y)])
-        self.sync()
-        self.assertEqual(len(self.names(self.box.b)), 3, "the held create goes through one run later")
+        self.assertEqual(after.problems, [])
+        self.assertEqual(len(self.names(self.box.b)), 3)
 
     def test_stale_temp_files_are_swept_from_the_tools_own_folders_too(self):
         self.settings.kept_root.mkdir(parents=True)

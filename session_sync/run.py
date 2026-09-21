@@ -1,5 +1,5 @@
-"""One sync run, in the order that keeps a crash harmless (DESIGN.md R10):
-load, scan, plan, journal intents, write, rescan, settle, save."""
+"""One sync run, in the order that keeps a crash harmless (DESIGN.md R10): load, scan, plan,
+save what was seen, write (each create saved as it completes), rescan, settle, save."""
 import os
 import shutil
 import time
@@ -9,7 +9,6 @@ from typing import Callable, Dict, List, Optional
 
 from session_sync.applier import Applier, Outcome
 from session_sync.atomic import TEMP_PREFIX, TEMP_SUFFIX
-from session_sync.intent_log import IntentLog
 from session_sync.enrolment import (EnrolmentError, load_enrolled, reject_same_directory_twice,
                                     unenrolled_with_records, validate_partition)
 from session_sync.liveness import app_running, is_live, observe_logins
@@ -49,9 +48,6 @@ class Settings:
     def log_path(self) -> Path:
         return self.state_dir / "agent.log"
 
-    @property
-    def intent_log_path(self) -> Path:
-        return self.state_dir / "placing.log"
 
 
 class RunAborted(Exception):
@@ -93,8 +89,6 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
     partitions = _enrolled_or_abort(settings)
     stored = _state_or_abort(settings)
     on_disk = encode_state(stored)
-    intents = IntentLog(settings.intent_log_path)
-    _recover(stored, intents)
     if apply:
         _sweep_stale_temps(partitions + [settings.state_dir], now_ns())
         _sweep_stale_temps(_folders_under(settings.kept_root), now_ns())
@@ -119,32 +113,19 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
         save_state(settings.state_path, stored)
         on_disk = encode_state(stored)
     kept_dir = settings.kept_root / time.strftime("%Y%m%d-%H%M%S", time.localtime(now_ns() // 1_000_000_000))
-    applier = Applier(scans, kept_dir=kept_dir, before_create=intents.intend, after_create=intents.done,
+    applier = Applier(scans, kept_dir=kept_dir, on_created=_recorder(settings, stored),
                       is_live=lambda partition: is_live(partition, running(), now_ns() // 1_000_000, stored.logins))
     report.outcomes = applier.apply(the_plan)
     _remember_placements(stored, report.done, scans)
 
     fresh = _scan_or_abort(partitions, {key: scan.cache for key, scan in scans.items()}, now_ns,
                            "This run's writes stand, but what it learned was not saved. The next run checks again.")
-    stored.sync = settle(stored.sync, [scan.snapshot for scan in fresh.values()],
-                         also_present=_created(report.done))
+    stored.sync = settle(stored.sync, [scan.snapshot for scan in fresh.values()])
     stored.cache = {key: scan.cache for key, scan in fresh.items()}
     if not report.failures:
         _prune_kept(settings.kept_root, now_ns(), never=kept_dir)
     _save_if_worth_it(settings, stored, on_disk, clean=not report.failures, now_ms=now_ns() // 1_000_000)
-    intents.clear()
     return report
-
-
-def _recover(stored: StoredState, intents: IntentLog) -> None:
-    """Reads what a run that did not finish left in the journal. A create known to have completed
-    is presence like any other (R7). One with no proof is held back for a run. The journal stays
-    on disk until a run has saved its state, so nothing here needs saving early."""
-    journal = intents.read()
-    for partition, session_ids in journal.completed.items():
-        stored.sync.seen.setdefault(partition, set()).update(session_ids)
-    for partition, session_ids in journal.pending.items():
-        stored.sync.placing.setdefault(partition, set()).update(session_ids)
 
 
 def _remember_what_was_seen(stored: StoredState, scans: Dict[str, PartitionScan]) -> bool:
@@ -157,12 +138,20 @@ def _remember_what_was_seen(stored: StoredState, scans: Dict[str, PartitionScan]
     return grew
 
 
-def _created(done: List[Outcome]) -> Dict[str, set]:
-    created: Dict[str, set] = {}
-    for outcome in done:
-        if isinstance(outcome.action, CreateRecord):
-            created.setdefault(outcome.action.target, set()).add(outcome.action.session_id)
-    return created
+def _recorder(settings: Settings, stored: StoredState) -> Callable[[str, str], None]:
+    """Writes a create down the moment it completes. One store holds what was ever in a partition,
+    so nothing can disagree with it, and a run that stops afterwards has nothing left to recover."""
+    def record(partition: str, session_id: str) -> None:
+        known = stored.sync.seen.setdefault(partition, set())
+        was_known = session_id in known
+        known.add(session_id)
+        try:
+            save_state(settings.state_path, stored)
+        except BaseException:
+            if not was_known:
+                known.discard(session_id)  # the applier undoes the create, so there is nothing to remember
+            raise
+    return record
 
 
 def _remember_placements(stored: StoredState, done: List[Outcome], scans: Dict[str, PartitionScan]) -> None:
@@ -190,14 +179,13 @@ def forget_presence(settings: Settings, session_id: str) -> List[str]:
     """R7's way out for one session: the next run may recreate it where it was lost."""
     stored = load_state(settings.state_path)
     forgotten = []
-    for memory in (stored.sync.seen, stored.sync.placing):
-        for partition, ids in memory.items():
-            if session_id in ids:
-                ids.discard(session_id)
-                forgotten.append(partition)
+    for partition, ids in stored.sync.seen.items():
+        if session_id in ids:
+            ids.discard(session_id)
+            forgotten.append(partition)
     if forgotten:
         save_state(settings.state_path, stored)
-    return sorted(set(forgotten))
+    return sorted(forgotten)
 
 
 def remember_reported(settings: Settings, digest: str) -> None:

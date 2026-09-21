@@ -88,9 +88,9 @@ class CreatingARecord(ApplierTest):
         self.assertEqual(self.names(self.box.b), [])
 
 
-    def test_a_create_and_its_journal_line_cannot_be_split_by_a_stop_signal(self):
-        # launchd stops an agent with SIGTERM. Landing between the link and the journal line, it
-        # would leave a completed create that looks as if it may never have happened.
+    def test_a_create_and_its_record_in_the_state_cannot_be_split_by_a_stop_signal(self):
+        # launchd stops an agent with SIGTERM. Landing between the link and the save, it would
+        # leave a record nobody wrote down.
         import signal
         import session_sync.applier as module
         from session_sync.cli import install_sigterm_handler
@@ -98,11 +98,10 @@ class CreatingARecord(ApplierTest):
         self.addCleanup(signal.signal, signal.SIGTERM, previous)
         install_sigterm_handler()
         write_record(self.box.a, X)
-        journal = []
+        recorded = []
         scans = {str(p): scan_partition(p, {}, clock=lambda: NOW_NS) for p in (self.box.a, self.box.b)}
         applier = Applier(scans, is_live=lambda partition: False, kept_dir=self.kept,
-                          before_create=lambda partition, sid: journal.append(("intend", sid)),
-                          after_create=lambda partition, sid: journal.append(("done", sid)))
+                          on_created=lambda partition, sid: recorded.append(sid))
         real = module.commit_create
 
         def stop_signal_right_after_the_link(temporary, destination):
@@ -113,8 +112,43 @@ class CreatingARecord(ApplierTest):
             with self.assertRaises(SystemExit):
                 applier.apply(Plan(actions=[CreateRecord(X, source=self.A, target=self.B)]))
 
-        self.assertEqual(journal, [("intend", X), ("done", X)])
+        self.assertEqual(recorded, [X], "the create was recorded before the stop signal took effect")
         self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
+
+    def test_a_create_that_cannot_be_recorded_is_undone(self):
+        # Presence that is not written down would let a later run put back a record the app removed.
+        write_record(self.box.a, X)
+        write_record(self.box.a, Y)
+        scans = {str(p): scan_partition(p, {}, clock=lambda: NOW_NS) for p in (self.box.a, self.box.b)}
+
+        def recording_fails_for_x(partition, sid):
+            if sid == X:
+                raise PermissionError("state.json")
+
+        applier = Applier(scans, is_live=lambda partition: False, kept_dir=self.kept,
+                          on_created=recording_fails_for_x)
+
+        outcomes = applier.apply(Plan(actions=[CreateRecord(X, source=self.A, target=self.B),
+                                               CreateRecord(Y, source=self.A, target=self.B)]))
+
+        self.assertIn("PermissionError", outcomes[0].problem)
+        self.assertIsNone(outcomes[1].problem)
+        self.assertEqual(self.names(self.box.b), ["local_%s.json" % Y])
+
+    def test_a_create_that_can_neither_be_recorded_nor_undone_says_so(self):
+        import session_sync.applier as module
+        write_record(self.box.a, X)
+        scans = {str(p): scan_partition(p, {}, clock=lambda: NOW_NS) for p in (self.box.a, self.box.b)}
+
+        def recording_fails(partition, sid):
+            raise PermissionError("state.json")
+
+        applier = Applier(scans, is_live=lambda partition: False, kept_dir=self.kept, on_created=recording_fails)
+
+        with mock.patch.object(module.os, "unlink", side_effect=PermissionError("cannot remove")):
+            outcomes = applier.apply(Plan(actions=[CreateRecord(X, source=self.A, target=self.B)]))
+
+        self.assertIn("could be neither recorded nor undone", outcomes[0].problem)
 
 
 class ReplacingARecord(ApplierTest):

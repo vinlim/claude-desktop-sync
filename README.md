@@ -45,7 +45,7 @@ The full contract, with the facts about the app it relies on and where each was 
 - **Conflicts keep the loser.** Later activity wins, the replaced copy is kept, and a true tie is reported and left for you.
 - **Deletes stay deleted**, and a re-adopted session survives an old delete marker.
 - **Safe beside the running app.** It never replaces a file in a directory the app may hold, never overwrites on create, and re-checks every guard at the moment of the write.
-- **Crash safe.** Writes are staged and renamed into place, each create is logged just before it happens, and a stopped run cleans up after itself.
+- **Crash safe.** Writes are staged and renamed into place, each create is written down the moment it completes, and a stopped run cleans up after itself.
 - **Bounded.** Kept copies are pruned after 30 days and above 500 MB. The log is capped.
 - **Optional background agent** that runs whenever an enrolled directory changes.
 - **No dependencies.** Python 3.9 or later, standard library only. The Python that ships with the macOS developer tools is enough.
@@ -135,7 +135,7 @@ planned     3  create record -> 1a2b3c4d/9f8e7d6c
 Dry run. Pass --apply to write.
 ```
 
-A line that starts with a session id is something the tool left alone on purpose, with the reason: the directory is in use, the copies are tied, the record was lost without a delete marker, a copy cannot be read, a copy's last activity is dated in the future, or a create from a run that did not finish is being held back for one run. `In sync.` means there was nothing to do.
+A line that starts with a session id is something the tool left alone on purpose, with the reason: the directory is in use, the copies are tied, the record was lost without a delete marker, a copy cannot be read, or a copy's last activity is dated in the future. `In sync.` means there was nothing to do.
 
 ## Where it keeps things
 
@@ -147,7 +147,6 @@ Everything the tool writes for itself is in `~/.local/state/claude-desktop-sessi
 | `state.json` | What each side last agreed on, and the login last seen |
 | `kept/` | Copies that were replaced or retired |
 | `agent.log` | The unattended log |
-| `placing.log` | Creates in flight, read after a run that did not finish |
 
 To remove the tool, run `--uninstall-agent`, then delete that directory, the clone and the symlink. The records it copied stay where they are and are ordinary app records.
 

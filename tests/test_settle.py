@@ -57,18 +57,6 @@ class FinishedDeletes(unittest.TestCase):
         self.assertEqual(after.seen, {"A": {X}, "B": {X}})
 
 
-class PresenceFromTheRunItself(unittest.TestCase):
-    def test_what_the_run_saw_or_placed_counts_even_if_the_final_scan_no_longer_shows_it(self):
-        after = settle(state(), [snapshot("A", {X: copy("v1")}), snapshot("B")], also_present={"B": {X}})
-
-        self.assertEqual(after.seen, {"A": {X}, "B": {X}})
-
-    def test_it_is_still_forgotten_once_no_partition_holds_the_record(self):
-        after = settle(state(), [snapshot("A"), snapshot("B")], also_present={"A": {X}, "B": {X}})
-
-        self.assertEqual(after.seen, {"A": set(), "B": set()})
-
-
 class RememberedPlacements(unittest.TestCase):
     """R3: a version the tool placed counts as unchanged only while it is still exactly that."""
 
@@ -107,10 +95,6 @@ class Presence(unittest.TestCase):
 
         self.assertEqual(after.seen, {"A": set(), "B": set()})
 
-    def test_placing_intents_last_one_run(self):
-        after = settle(state(placing={"B": {X}}), [snapshot("A", {X: copy("v1")}), snapshot("B")])
-
-        self.assertEqual(after.placing, {})
 
 
 if __name__ == "__main__":

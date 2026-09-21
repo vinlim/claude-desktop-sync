@@ -47,7 +47,8 @@ class Definition(unittest.TestCase):
         self.assertEqual(definition["ProgramArguments"], ["/usr/bin/python3", "/tool/entry", "--apply", "--quiet"])
         self.assertEqual(definition["WatchPaths"], ["/data/a", "/data/b"])
         self.assertEqual((definition["StandardOutPath"], definition["StandardErrorPath"]),
-                         ("/state/agent.log", "/state/agent.log"))
+                         ("/state/agent-crash.log", "/state/agent-crash.log"),
+                         "launchd's own handle only ever receives an unexpected traceback")
         self.assertGreaterEqual(definition["ThrottleInterval"], 10)
         self.assertTrue(definition["StartInterval"] > 0 and definition["RunAtLoad"])
 

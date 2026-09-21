@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from session_sync.atomic import create_exclusive, write_atomic
+from session_sync.atomic import commit_create, commit_replace, create_exclusive, discard, stage, write_atomic
 from session_sync.fingerprint import fingerprint
 from session_sync.model import (Action, CreateRecord, CreateTombstone, Plan, ReplaceRecord, RetireRecord, RetireTmp,
                                 RetireTombstone)
@@ -16,6 +16,7 @@ from session_sync.scanner import PartitionScan, Stamp, record_path, stamp_of, tm
 class Outcome:
     action: Action
     problem: Optional[str]  # None: done
+    kept: Optional[Path] = None  # where the replaced or retired file went
 
 
 class Refused(Exception):
@@ -44,42 +45,44 @@ class Applier:
             if action.session_id in stopped:
                 outcomes.append(Outcome(action, "an earlier step for this session did not complete"))
                 continue
-            problem = self._attempt(action)
-            if problem:
+            outcome = self._attempt(action)
+            if outcome.problem:
                 stopped.add(action.session_id)
-            outcomes.append(Outcome(action, problem))
+            outcomes.append(outcome)
         return outcomes
 
-    def _attempt(self, action: Action) -> Optional[str]:
+    def _attempt(self, action: Action) -> Outcome:
         try:
-            self.handlers[type(action)](action)
+            return Outcome(action, None, kept=self.handlers[type(action)](action))
         except Refused as refusal:
-            return str(refusal)
+            return Outcome(action, str(refusal))
         except OSError as error:
-            return "%s: %s" % (type(error).__name__, error)
-        return None
+            return Outcome(action, "%s: %s" % (type(error).__name__, error))
 
     # -- records ---------------------------------------------------------------
 
     def _create_record(self, action: CreateRecord) -> None:
         data, mtime_ns = self._read_planned_record(action.source, action.session_id)
-        try:
-            create_exclusive(record_path(Path(action.target), action.session_id), data, mtime_ns)
-        except FileExistsError:
-            raise Refused("a file appeared at the target since the scan")
+        self._create(record_path(Path(action.target), action.session_id), data, mtime_ns,
+                     "a file appeared at the target since the scan")
 
-    def _replace_record(self, action: ReplaceRecord) -> None:
+    def _replace_record(self, action: ReplaceRecord) -> Optional[Path]:
         data, mtime_ns = self._read_planned_record(action.source, action.session_id)
         partition = Path(action.target)
         path = record_path(partition, action.session_id)
         scanned = self.scans[action.target].records.get(action.session_id)
-        self._guard_existing(partition, path, scanned)
-        if action.keep:
-            self._keep(partition, path)
-            self._guard_existing(partition, path, scanned)
-        write_atomic(path, data, mtime_ns)
+        self._guard_existing(partition, path, scanned)  # before anything is written: a refusal leaves no trace
+        kept = self._keep(partition, path) if action.keep else None
+        staged = stage(path, data, mtime_ns)
+        try:
+            self._guard_existing(partition, path, scanned)  # after the slow write, right before the rename
+        except Refused:
+            discard(staged)
+            raise
+        commit_replace(staged, path)
+        return kept
 
-    def _retire_record(self, action: RetireRecord) -> None:
+    def _retire_record(self, action: RetireRecord) -> Optional[Path]:
         partition = Path(action.target)
         scan = self.scans[action.target]
         sibling = tmp_path(partition, action.session_id)
@@ -89,12 +92,13 @@ class Applier:
         # The temp file goes first: left behind alone, the app would promote it to a live record.
         if scanned_sibling is not None:
             self._retire(partition, sibling, scanned_sibling)
-        self._retire(partition, record_path(partition, action.session_id), scan.records.get(action.session_id))
+        return self._retire(partition, record_path(partition, action.session_id),
+                            scan.records.get(action.session_id))
 
-    def _retire_tmp(self, action: RetireTmp) -> None:
+    def _retire_tmp(self, action: RetireTmp) -> Optional[Path]:
         partition = Path(action.target)
-        self._retire(partition, tmp_path(partition, action.session_id),
-                     self.scans[action.target].tmps.get(action.session_id))
+        return self._retire(partition, tmp_path(partition, action.session_id),
+                            self.scans[action.target].tmps.get(action.session_id))
 
     # -- tombstones ------------------------------------------------------------
 
@@ -103,17 +107,29 @@ class Applier:
         stamp = stamp_of(source)
         if stamp is None:
             raise Refused("the source tombstone is gone")
+        target = tombstone_path(Path(action.target), action.session_id)
+        if os.path.lexists(target):
+            return  # the app, or an earlier run, already put one there
         try:
-            create_exclusive(tombstone_path(Path(action.target), action.session_id), source.read_bytes(), stamp[0])
+            create_exclusive(target, source.read_bytes(), stamp[0])
         except FileExistsError:
-            pass  # the app, or an earlier run, already put one there
+            pass
 
-    def _retire_tombstone(self, action: RetireTombstone) -> None:
+    def _retire_tombstone(self, action: RetireTombstone) -> Optional[Path]:
         partition = Path(action.target)
-        self._retire(partition, tombstone_path(partition, action.session_id),
-                     self.scans[action.target].tombstones.get(action.session_id))
+        return self._retire(partition, tombstone_path(partition, action.session_id),
+                            self.scans[action.target].tombstones.get(action.session_id))
 
     # -- shared steps ----------------------------------------------------------
+
+    def _create(self, target: Path, data: bytes, mtime_ns: int, refusal: str) -> None:
+        """Checks first so a standing refusal writes nothing: a watched directory would refire on it."""
+        if os.path.lexists(target):
+            raise Refused(refusal)
+        try:
+            commit_create(stage(target, data, mtime_ns), target)
+        except FileExistsError:
+            raise Refused(refusal)
 
     def _read_planned_record(self, source_key: str, session_id: str) -> Tuple[bytes, int]:
         """The bytes of exactly the version the planner chose (R2)."""
@@ -135,16 +151,28 @@ class Applier:
         if scanned is None or stamp_of(path) != scanned:
             raise Refused("target changed since the scan")
 
-    def _keep(self, partition: Path, path: Path) -> None:
+    def _keep(self, partition: Path, path: Path) -> Path:
         stamp = stamp_of(path)
         if stamp is None:
             raise Refused("target changed since the scan")
         folder = self.kept_dir / ("%s_%s" % (partition.parent.name, partition.name))
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-        write_atomic(folder / path.name, path.read_bytes(), stamp[0])
+        kept = _unused_name(folder / path.name)
+        write_atomic(kept, path.read_bytes(), stamp[0])
+        return kept
 
-    def _retire(self, partition: Path, path: Path, scanned: Optional[Stamp]) -> None:
+    def _retire(self, partition: Path, path: Path, scanned: Optional[Stamp]) -> Path:
         self._guard_existing(partition, path, scanned)
-        self._keep(partition, path)
+        kept = self._keep(partition, path)
         self._guard_existing(partition, path, scanned)
         os.unlink(path)
+        return kept
+
+
+def _unused_name(path: Path) -> Path:
+    """Two runs in one second share a kept folder, and a kept copy must never replace another."""
+    candidate, attempt = path, 0
+    while os.path.lexists(candidate):
+        attempt += 1
+        candidate = path.with_name("%s.%d" % (path.name, attempt))
+    return candidate

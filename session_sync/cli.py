@@ -1,7 +1,9 @@
 """Command line entry: parses arguments, takes the lock, prints the report."""
 import argparse
 import fcntl
+import hashlib
 import signal
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -12,12 +14,14 @@ from session_sync import agent
 from session_sync.enrolment import EnrolmentError, SESSIONS_DIR, enrol, load_enrolled, unenrol, unenrolled_with_records
 from session_sync.liveness import app_running
 from session_sync.report import render
-from session_sync.run import RunAborted, Settings, remember_reported, sync
+from session_sync.run import RunAborted, Settings, forget_presence, remember_reported, sync
 from session_sync.state_store import StateUnusable, load_state
 
 DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "claude-desktop-session-sync"
 DEFAULT_SESSIONS_DIR = Path.home() / "Library" / "Application Support" / "Claude" / SESSIONS_DIR
 ENTRY_SCRIPT = Path(__file__).resolve().parent.parent / "claude-desktop-session-sync"
+
+STALE_AGENT_S = 3600  # a healthy agent runs at least every five minutes
 
 DESCRIPTION = """Keep the Claude desktop app's Code sidebar the same under every account.
 
@@ -33,6 +37,8 @@ class Environment:
     running: Callable[[], bool] = app_running
     sessions_dir: Path = DEFAULT_SESSIONS_DIR
     agent_plist: Path = agent.PLIST
+    launchctl: Callable = subprocess.run
+    quiet_out: Optional[TextIO] = None  # None: quiet runs append to the log file
 
 
 def install_sigterm_handler() -> None:
@@ -45,7 +51,7 @@ def main(argv: List[str], env: Optional[Environment] = None) -> int:
         env = Environment()
         install_sigterm_handler()
     args = _parser().parse_args(argv)
-    say = lambda text: print(text, file=env.out)  # noqa: E731
+    say = _log_writer(env) if args.quiet else (lambda text: print(text, file=env.out))
 
     try:
         if args.enroll or args.unenroll:
@@ -54,17 +60,33 @@ def main(argv: List[str], env: Optional[Environment] = None) -> int:
             return _list(env, say)
         if args.reset_state:
             return _reset_state(env, say)
+        if args.recreate:
+            return _recreate(args.recreate, env, say)
         if args.status:
             return _status(env, say)
         if args.install_agent:
             return _install_agent(env, say)
         if args.uninstall_agent:
-            say("Removed the agent." if agent.uninstall(env.agent_plist) else "No agent was installed.")
+            removed = agent.uninstall(env.agent_plist, env.launchctl)
+            say("Removed the agent." if removed else "No agent was installed.")
             return 0
         return _run(args, env, say)
-    except (RunAborted, EnrolmentError, agent.AgentError) as error:
-        say(str(error))
+    except (RunAborted, EnrolmentError, agent.AgentError, StateUnusable) as error:
+        _say_abort(str(error), args.quiet, env, say)
         return 2
+
+
+def _log_writer(env: Environment):
+    """A quiet run writes its own log file. The file launchd holds open is left for tracebacks,
+    so capping the log never depends on how launchd opened it."""
+    def write(text: str) -> None:
+        if env.quiet_out is not None:
+            print(text, file=env.quiet_out)
+            return
+        env.settings.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with open(env.settings.log_path, "a") as log:
+            log.write(text + "\n")
+    return write
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -74,6 +96,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true", help="list every action")
     parser.add_argument("--quiet", action="store_true", help="print only writes, and standing problems once")
     parser.add_argument("--prefer", metavar="PARTITION", help="settle tied conflicts in favour of this partition")
+    parser.add_argument("--session", metavar="ID", help="with --prefer: settle only this session")
+    parser.add_argument("--recreate", metavar="ID",
+                        help="let the next run put back a session that was reported as gone without a delete marker")
     parser.add_argument("--list", action="store_true", help="show enrolled partitions and candidates")
     parser.add_argument("--enroll", action="append", metavar="PATH", help="allow a partition to be synced")
     parser.add_argument("--unenroll", action="append", metavar="PATH", help="stop syncing a partition")
@@ -88,6 +113,7 @@ def _run(args, env: Environment, say) -> int:
     env.settings.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.quiet:
         agent.cap_log(env.settings.log_path)
+        agent.cap_log(agent.crash_log(env.settings.log_path))
     with open(env.settings.lock_path, "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -95,7 +121,9 @@ def _run(args, env: Environment, say) -> int:
             if not args.quiet:
                 say("Another sync is running.")
             return 0
-        report = sync(env.settings, apply=args.apply, prefer=args.prefer, now_ns=env.now_ns, running=env.running)
+        report = sync(env.settings, apply=args.apply, prefer=args.prefer, prefer_session=args.session,
+                      now_ns=env.now_ns, running=env.running)
+        _clear_abort_marker(env)
         previous = _reported(env) if args.quiet else ""
         text, digest = render(report, verbose=args.verbose, quiet=args.quiet, previous_digest=previous)
         if args.quiet and args.apply:
@@ -112,15 +140,45 @@ def _reported(env: Environment) -> str:
         return ""
 
 
+def _say_abort(message: str, quiet: bool, env: Environment, say) -> None:
+    """R12: an unattended run fires every few seconds, so a standing abort is logged once.
+    The marker is a file of its own because the state file may be the thing that is broken."""
+    if not quiet:
+        say(message)
+        return
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    marker = _abort_marker(env)
+    if marker.exists() and marker.read_text() == digest:
+        return
+    env.settings.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    marker.write_text(digest)
+    say("%s\n%s" % (_timestamp(env), message))
+
+
+def _abort_marker(env: Environment) -> Path:
+    return env.settings.state_dir / "last-abort"
+
+
+def _clear_abort_marker(env: Environment) -> None:
+    try:
+        _abort_marker(env).unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _change_enrolment(args, env: Environment, say) -> int:
     for path in args.enroll or []:
         enrol(env.settings.config_path, Path(path))
     for path in args.unenroll or []:
         unenrol(env.settings.config_path, Path(path))
     enrolled = load_enrolled(env.settings.config_path)
-    if agent.is_installed(env.agent_plist) and len(enrolled) >= 2:
-        agent.install(ENTRY_SCRIPT, enrolled, env.settings.log_path, env.agent_plist)
-        say("The background agent now watches the new set.")
+    if agent.is_installed(env.agent_plist):
+        if len(enrolled) >= 2:
+            agent.install(ENTRY_SCRIPT, enrolled, env.settings.log_path, env.agent_plist, env.launchctl)
+            say("The background agent now watches the new set.")
+        else:
+            agent.uninstall(env.agent_plist, env.launchctl)
+            say("Fewer than two partitions are enrolled, so the background agent was removed.")
     return _list(env, say)
 
 
@@ -143,20 +201,35 @@ def _reset_state(env: Environment, say) -> int:
     aside = path.with_name("%s.before-reset-%s" % (path.name, time.strftime("%Y%m%d-%H%M%S",
                                                                            time.localtime(env.now_ns() // 10 ** 9))))
     path.rename(aside)
-    say("Sync history forgotten. The old file is kept as %s" % aside)
+    say("Sync history forgotten. The old file is kept as %s\n"
+        "The next run treats every session as first contact: copies that differ are decided by lastActivityAt "
+        "and the losing copy is kept, and a session missing on one side is copied there. Deletes are decided "
+        "by time as before. Prefer --recreate ID or --prefer for a single stuck session." % aside)
+    return 0
+
+
+def _recreate(session_id: str, env: Environment, say) -> int:
+    forgotten = forget_presence(env.settings, session_id)
+    if forgotten:
+        say("%s may be recreated in: %s\nRun again with --apply." % (session_id, ", ".join(forgotten)))
+    else:
+        say("%s was not recorded as present anywhere, so nothing holds it back." % session_id)
     return 0
 
 
 def _status(env: Environment, say) -> int:
     enrolled = load_enrolled(env.settings.config_path)
     say("enrolled partitions: %d" % len(enrolled))
-    say("background agent: %s" % ("installed" if agent.is_installed(env.agent_plist) else "not installed"))
-    try:
-        last = load_state(env.settings.state_path).last_success_ms
-    except StateUnusable as error:
-        say(str(error))
-        return 2
-    say("last clean run: %s" % (_ago(env.now_ns() // 1_000_000 - last) if last else "never"))
+    installed = agent.is_installed(env.agent_plist)
+    loaded = installed and agent.is_loaded(env.launchctl)
+    say("background agent: %s" % ("not installed" if not installed else "installed and loaded" if loaded
+                                  else "installed but not loaded. Run --install-agent again"))
+    last = load_state(env.settings.state_path).last_success_ms
+    age_ms = env.now_ns() // 1_000_000 - last
+    say("last clean run: %s" % (_ago(age_ms) if last else "never"))
+    if installed and last and age_ms > STALE_AGENT_S * 1000:
+        say("The agent is installed but there has been no clean run for %s. Check %s"
+            % (_ago(age_ms).replace(" ago", ""), env.settings.log_path))
     if len(enrolled) >= 2:
         report = sync(env.settings, apply=False, now_ns=env.now_ns, running=env.running)
         say(render(report)[0])
@@ -168,7 +241,7 @@ def _install_agent(env: Environment, say) -> int:
     if len(enrolled) < 2:
         raise EnrolmentError("Enrol at least two partitions before installing the agent.")
     env.settings.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    agent.install(ENTRY_SCRIPT, enrolled, env.settings.log_path, env.agent_plist)
+    agent.install(ENTRY_SCRIPT, enrolled, env.settings.log_path, env.agent_plist, env.launchctl)
     say("Installed %s\nIt logs to %s" % (env.agent_plist, env.settings.log_path))
     return 0
 

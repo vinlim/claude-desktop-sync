@@ -9,16 +9,19 @@ from typing import Callable, Dict, List, Optional
 
 from session_sync.applier import Applier, Outcome
 from session_sync.atomic import TEMP_PREFIX, TEMP_SUFFIX
-from session_sync.enrolment import EnrolmentError, load_enrolled, unenrolled_with_records, validate_partition
+from session_sync.enrolment import (EnrolmentError, load_enrolled, reject_same_directory_twice,
+                                    unenrolled_with_records, validate_partition)
 from session_sync.liveness import app_running, is_live
-from session_sync.model import Action, CreateRecord, Plan, Problem
+from session_sync.model import Action, CreateRecord, Plan, Problem, ReplaceRecord
 from session_sync.planner import plan
 from session_sync.scanner import PartitionScan, scan_partition, stamp_of
 from session_sync.settle import settle
-from session_sync.state_store import StateUnusable, StoredState, load_state, save_state
+from session_sync.state_store import StateUnusable, StoredState, encode_state, load_state, save_state
 
 KEPT_MAX_AGE_S = 30 * 86400
+KEPT_MAX_BYTES = 500 * 1024 * 1024
 STALE_TEMP_AGE_S = 600
+HEARTBEAT_S = 300  # how stale "last clean run" may get before an otherwise idle run writes it down
 
 
 @dataclass(frozen=True)
@@ -80,18 +83,20 @@ def label(partition: Path) -> str:
     return "%s/%s" % (partition.parent.name[:8], partition.name[:8])
 
 
-def sync(settings: Settings, apply: bool, prefer: Optional[str] = None,
+def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_session: Optional[str] = None,
          now_ns: Callable[[], int] = time.time_ns, running: Callable[[], bool] = app_running) -> RunReport:
     partitions = _enrolled_or_abort(settings)
     stored = _state_or_abort(settings)
+    on_disk = encode_state(stored)
     if apply:
-        _sweep_stale_temps(partitions, now_ns())
+        _sweep_stale_temps(partitions + [settings.state_dir], now_ns())
+        _sweep_stale_temps(_folders_under(settings.kept_root), now_ns())
 
     scans = _scan(partitions, stored.cache, now_ns())
     app_is_running = running()
-    live = {str(p) for p in partitions if is_live(p, app_is_running)}
+    live = {str(p) for p in partitions if is_live(p, app_is_running, now_ns())}
     the_plan = plan([scan.snapshot for scan in scans.values()], stored.sync, live,
-                    _resolve_prefer(prefer, partitions))
+                    _resolve_prefer(prefer, partitions), prefer_session)
     report = RunReport(
         applied=apply,
         partitions=[PartitionSummary(p, len(scans[str(p)].records), len(scans[str(p)].tombstones), str(p) in live)
@@ -101,19 +106,56 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None,
     if not apply:
         return report
 
-    _journal_intents(settings, stored, the_plan)
+    if _journal_intents(stored, the_plan):
+        save_state(settings.state_path, stored)
+        on_disk = encode_state(stored)
     kept_dir = settings.kept_root / time.strftime("%Y%m%d-%H%M%S", time.localtime(now_ns() // 1_000_000_000))
-    applier = Applier(scans, is_live=lambda partition: is_live(partition, running()), kept_dir=kept_dir)
+    applier = Applier(scans, is_live=lambda partition: is_live(partition, running(), now_ns()), kept_dir=kept_dir)
     report.outcomes = applier.apply(the_plan)
+    _remember_placements(stored, report.done, scans)
 
     fresh = _scan(partitions, {key: scan.cache for key, scan in scans.items()}, now_ns())
     stored.sync = settle(stored.sync, [scan.snapshot for scan in fresh.values()])
     stored.cache = {key: scan.cache for key, scan in fresh.items()}
     if not report.failures:
-        stored.last_success_ms = now_ns() // 1_000_000
         _prune_kept(settings.kept_root, now_ns())
-    save_state(settings.state_path, stored)
+    _save_if_worth_it(settings, stored, on_disk, clean=not report.failures, now_ms=now_ns() // 1_000_000)
     return report
+
+
+def _remember_placements(stored: StoredState, done: List[Outcome], scans: Dict[str, PartitionScan]) -> None:
+    """R3: a version the tool placed is not a change made by the app."""
+    for outcome in done:
+        action = outcome.action
+        if isinstance(action, (CreateRecord, ReplaceRecord)):
+            placed = scans[action.source].snapshot.records[action.session_id].state_hash
+            stored.sync.placed.setdefault(action.target, {})[action.session_id] = placed
+
+
+def _save_if_worth_it(settings: Settings, stored: StoredState, on_disk: dict, clean: bool, now_ms: int) -> None:
+    """An unattended run fires every few seconds while the app saves. Most runs change nothing,
+    so the last clean run is only written down when something else changed or it has gone stale."""
+    changed = {k: v for k, v in encode_state(stored).items() if k != "last_success_ms"} != \
+              {k: v for k, v in on_disk.items() if k != "last_success_ms"}
+    stale = now_ms - stored.last_success_ms > HEARTBEAT_S * 1000
+    if clean and (changed or stale):
+        stored.last_success_ms = now_ms
+    if changed or (clean and stale):
+        save_state(settings.state_path, stored)
+
+
+def forget_presence(settings: Settings, session_id: str) -> List[str]:
+    """R7's way out for one session: the next run may recreate it where it was lost."""
+    stored = load_state(settings.state_path)
+    forgotten = []
+    for memory in (stored.sync.seen, stored.sync.placing):
+        for partition, ids in memory.items():
+            if session_id in ids:
+                ids.discard(session_id)
+                forgotten.append(partition)
+    if forgotten:
+        save_state(settings.state_path, stored)
+    return sorted(set(forgotten))
 
 
 def remember_reported(settings: Settings, digest: str) -> None:
@@ -132,6 +174,7 @@ def _enrolled_or_abort(settings: Settings) -> List[Path]:
                                  "Run with --list to see candidates and --enroll PATH to add one." % len(partitions))
         for partition in partitions:
             validate_partition(partition)
+        reject_same_directory_twice(partitions)
     except EnrolmentError as error:
         raise RunAborted(str(error))
     return partitions
@@ -157,37 +200,58 @@ def _resolve_prefer(prefer: Optional[str], partitions: List[Path]) -> Optional[s
     raise RunAborted("--prefer %s names no enrolled partition. Use a path or label shown by --list." % prefer)
 
 
-def _journal_intents(settings: Settings, stored: StoredState, the_plan: Plan) -> None:
+def _journal_intents(stored: StoredState, the_plan: Plan) -> bool:
     """R7, R10: if this run dies after creating a record, the next run must know the
     record was there, or it would put back one the app removed in between."""
-    for action in the_plan.actions:
-        if isinstance(action, CreateRecord):
-            stored.sync.placing.setdefault(action.target, set()).add(action.session_id)
-    save_state(settings.state_path, stored)
+    intents = [action for action in the_plan.actions if isinstance(action, CreateRecord)]
+    for action in intents:
+        stored.sync.placing.setdefault(action.target, set()).add(action.session_id)
+    return bool(intents)
 
 
-def _sweep_stale_temps(partitions: List[Path], now: int) -> None:
-    for partition in partitions:
-        for name in os.listdir(partition):
+def _sweep_stale_temps(folders: List[Path], now: int) -> None:
+    """A killed run can leave a staged file behind. Anything this old belongs to no running sync."""
+    for folder in folders:
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
             if not (name.startswith(TEMP_PREFIX) and name.endswith(TEMP_SUFFIX)):
                 continue
-            stamp = stamp_of(partition / name)
+            stamp = stamp_of(folder / name)
             if stamp is not None and now - stamp[0] > STALE_TEMP_AGE_S * 1_000_000_000:
                 try:
-                    os.unlink(partition / name)
+                    os.unlink(folder / name)
                 except OSError:
                     pass
 
 
+def _folders_under(root: Path) -> List[Path]:
+    return [Path(folder) for folder, _, _ in os.walk(root)]
+
+
 def _prune_kept(kept_root: Path, now: int) -> None:
+    """Kept copies are bounded by age and by total size, oldest run first."""
     try:
-        runs = list(kept_root.iterdir())
+        runs = sorted((os.lstat(run).st_mtime_ns, run) for run in kept_root.iterdir()
+                      if run.is_dir() and not run.is_symlink())
     except OSError:
         return
-    for run_dir in runs:
-        try:
-            too_old = now - os.lstat(run_dir).st_mtime_ns > KEPT_MAX_AGE_S * 1_000_000_000
-        except OSError:
-            continue
-        if too_old and run_dir.is_dir() and not run_dir.is_symlink():
-            shutil.rmtree(run_dir, ignore_errors=True)
+    sizes = {run: _size_of(run) for _, run in runs}
+    total = sum(sizes.values())
+    for written_ns, run in runs:
+        if now - written_ns > KEPT_MAX_AGE_S * 1_000_000_000 or total > KEPT_MAX_BYTES:
+            shutil.rmtree(run, ignore_errors=True)
+            total -= sizes[run]
+
+
+def _size_of(folder: Path) -> int:
+    total = 0
+    for parent, _, files in os.walk(folder):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(parent, name)).st_size
+            except OSError:
+                pass
+    return total

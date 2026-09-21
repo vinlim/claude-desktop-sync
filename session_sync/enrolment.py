@@ -51,10 +51,27 @@ def enrol(config: Path, partition: Path) -> List[Path]:
     partition = Path(os.path.abspath(os.path.expanduser(str(partition))))
     validate_partition(partition)
     enrolled = load_enrolled(config)
-    if partition not in enrolled:
+    if not any(_same_directory(partition, other) for other in enrolled):
         enrolled.append(partition)
     _save(config, enrolled)
     return enrolled
+
+
+def reject_same_directory_twice(partitions: List[Path]) -> None:
+    """One directory enrolled under two spellings would be synced with itself."""
+    for index, partition in enumerate(partitions):
+        for other in partitions[index + 1:]:
+            if _same_directory(partition, other):
+                raise EnrolmentError("%s and %s are the same directory. Remove one with --unenroll." % (partition, other))
+
+
+def _same_directory(one: Path, other: Path) -> bool:
+    if one == other:
+        return True
+    try:
+        return os.path.samefile(one, other)
+    except OSError:
+        return False
 
 
 def unenrol(config: Path, partition: Path) -> List[Path]:

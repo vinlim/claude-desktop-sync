@@ -80,7 +80,7 @@ class DeleteTimes(unittest.TestCase):
                 self.assertEqual(scan(self.box.a).snapshot.tombstones[X], LONG_AGO_S * 1000)
 
     def test_a_time_in_the_future_is_not_trusted(self):
-        # The reviewer's P5: a future-dated tombstone must not outrank real activity.
+        # a future-dated tombstone must not outrank real activity.
         write_tombstone(self.box.a, X, deleted_at_ms=NOW_MS + 10 ** 9, at_s=LONG_AGO_S)
 
         self.assertEqual(scan(self.box.a).snapshot.tombstones[X], LONG_AGO_S * 1000)
@@ -97,7 +97,7 @@ class Robustness(unittest.TestCase):
         self.addCleanup(self.box.cleanup)
 
     def test_a_record_that_vanishes_while_being_read_is_skipped(self):
-        # The reviewer's P3: the app renames files under the scan.
+        # the app renames files under the scan.
         write_record(self.box.a, X)
         write_record(self.box.a, Y)
         real = Path.read_bytes
@@ -113,7 +113,7 @@ class Robustness(unittest.TestCase):
         self.assertEqual(set(result.snapshot.records), {Y})
 
     def test_a_tombstone_that_vanishes_while_being_read_is_skipped(self):
-        # The reviewer's P2.
+        # The app removes a tombstone when a session is re-adopted.
         tombstone = write_tombstone(self.box.a, X, 5)
         listed = os.lstat(tombstone)
         # Present when listed, gone by the time its content and then its own time are read.

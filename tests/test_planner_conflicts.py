@@ -5,8 +5,8 @@ from session_sync.planner import plan
 from tests.helpers import X, copy, snapshot, state, unreadable
 
 
-def planned(snapshots, sync_state=None, live=(), prefer=None):
-    return plan(snapshots, sync_state or state(), live=set(live), prefer=prefer)
+def planned(snapshots, sync_state=None, live=(), prefer=None, prefer_session=None):
+    return plan(snapshots, sync_state or state(), live=set(live), prefer=prefer, prefer_session=prefer_session)
 
 
 class BothSidesChanged(unittest.TestCase):
@@ -44,6 +44,17 @@ class BothSidesChanged(unittest.TestCase):
 
         self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=True)])
         self.assertEqual(result.problems, [])
+
+    def test_prefer_can_be_limited_to_one_session(self):
+        from tests.helpers import Y
+        tied = {X: copy("x2", activity=50), Y: copy("y2", activity=50)}
+        other = {X: copy("x3", activity=50), Y: copy("y3", activity=50)}
+
+        result = planned([snapshot("A", tied), snapshot("B", other)], state(agreed={X: "x1", Y: "y1"}),
+                         prefer="B", prefer_session=Y)
+
+        self.assertEqual(result.actions, [ReplaceRecord(Y, source="B", target="A", keep=True)])
+        self.assertEqual({p.session_id for p in result.problems}, {X})
 
     def test_prefer_does_not_override_a_clear_winner(self):
         result = planned([snapshot("A", {X: copy("v2", activity=90)}),
@@ -111,7 +122,7 @@ class LostRecords(unittest.TestCase):
     """R7."""
 
     def test_a_record_seen_before_and_now_gone_without_a_tombstone_is_not_recreated(self):
-        # The reviewer's P6: the app removes the record, then writes the tombstone later.
+        # the app removes the record, then writes the tombstone later.
         result = planned([snapshot("A", {X: copy("v1")}), snapshot("B")],
                          state(agreed={X: "v1"}, seen={"A": {X}, "B": {X}}))
 

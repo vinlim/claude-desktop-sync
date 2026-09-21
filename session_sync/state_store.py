@@ -39,10 +39,10 @@ def load_state(path: Path) -> StoredState:
 
 def save_state(path: Path, stored: StoredState) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    write_atomic(path, json.dumps(_encode(stored), indent=1, sort_keys=True).encode("utf-8"))
+    write_atomic(path, json.dumps(encode_state(stored), indent=1, sort_keys=True).encode("utf-8"))
 
 
-def _encode(stored: StoredState) -> dict:
+def encode_state(stored: StoredState) -> dict:
     sync = stored.sync
     return {
         "version": VERSION,

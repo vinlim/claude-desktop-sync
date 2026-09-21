@@ -8,65 +8,60 @@ The Claude desktop app keeps its Code sidebar as one index per login. One person
 
 ## Facts about the app that the design relies on
 
-Verified against desktop app 2.2553.1 (main-process JavaScript) on 2026-09-21. Re-verify after a major app update.
+Verified against desktop app 2.2553.1 (main-process JavaScript) on 2026-09-21. Re-verify after a major app update: every rule below leans on at least one of these.
 
 | # | Fact | Where verified |
 |---|------|----------------|
 | F1 | A sidebar index lives at `<userData>/claude-code-sessions/<accountUuid>/<orgUuid>/`. The path is built from the login; symlinked components are refused (`O_NOFOLLOW`, `lstat` walk). | `getStorageDir`, `Ci`, `xi` |
-| F2 | A record is `local_<id>.json`. It names no account. It points at a transcript through `cliSessionId`. | record key census over 794 files; loader `uS` has no account check |
+| F2 | A record is `local_<id>.json`. The loader checks no account, and it points at a transcript through `cliSessionId`. Records can still hold account-linked data: `bridgeSessionIds`, `remoteMcpServersConfig`, `envScopeId`, `scheduledTaskId`, and optionally `emailAddress` (none on disk at the time of writing). | loader `uS`; key census over 794 records |
 | F3 | A delete removes `local_<id>.json.tmp` and `local_<id>.json` first, then writes `deleted_<id>` files holding the delete time in epoch ms. Work happens between the two steps, longer for imported sessions. | session delete routine, `ax` |
 | F4 | Tombstone ids are filtered by sessions loaded in memory for the current login only, so a copy under another login does not suppress a tombstone. | `cliSessionIdsClaimedByLoadedSessions({localOnly:true})` |
-| F5 | The app reads a partition when a login initialises, has no directory watcher, and rewrites a record from memory on every save. Memory wins over disk for a loaded session. | `loadSessionRecords`, `writeSessionToDisk` |
-| F6 | Making a session visible saves its record with a new `lastFocusedAt`. File mtime therefore says nothing about which copy has newer state. | `setSessionVisibility` |
-| F7 | Saves are write-temp-then-rename, with a direct-write fallback on some errors. At startup the app promotes an orphaned `local_*.json.tmp` to a live record. | `fS`, persistence writer |
+| F5 | The app reads a partition when a login initialises, has no directory watcher, and rewrites a record from memory on every save. Memory wins over disk for a loaded session. The loader never reads tombstones: a record beside `deleted_<id>` still loads. | `loadSessionRecords`, `writeSessionToDisk` |
+| F6 | Making a session visible saves its record with a new `lastFocusedAt`, so file mtime says nothing about which copy has newer state. At load each login stamps its own `errorAt` on a side session that never started. `lastActivityAt` moves only on real activity (19 assignment sites: sending, turn start, frames from the CLI, permission answers, rewind and clear, a session closing on its own). | `setSessionVisibility`, `loadSessionRecords`, assignment census |
+| F7 | Saves are write-temp-then-rename, with a direct-write fallback on some errors. At startup the app promotes an orphaned `local_*.json.tmp` younger than 30 days to a live record, with no tombstone check. | `fS`, persistence writer |
 | F8 | The app's own picker for CLI transcripts excludes, and refuses to adopt, any session id recorded under any login on the install. Copying records is the only way to share them. | `list`, `resolveForResume`, `lx` |
-| F9 | `lastKnownAccountUuid` in `<userData>/config.json` is written synchronously before the session manager re-initialises, and is not cleared at logout. | `Io.set(Qbe, …)` |
-| F10 | A re-import of a CLI transcript creates `local_<cliId>.json` and removes `deleted_<cliId>` under the current login only. Its `createdAt` and `lastActivityAt` come from the transcript and can predate an old tombstone. | `adoptCliSession`, `cx` |
-| F11 | The app ignores files in a partition that do not start with `local_` or `deleted_`. | every reader filters on the prefix |
-| F12 | With multi-account parking, a session still running under the previous login stays in memory and keeps saving into its own partition. The current login does not load a second copy of an id it already holds. | `parked`, `storageDirFor`, loader duplicate check |
-| F13 | Records hold `bridgeSessionIds` and `remoteMcpServersConfig`. Bridge ids are sent to the Remote Control API with the current login's token when such a session is archived or deleted, not at load. | `cleanupRemoteBridgeSessions` callers |
+| F9 | `lastKnownAccountUuid` in `<userData>/config.json` is written synchronously when the login changes, before the previous login's pending saves are flushed. It is not cleared at logout. | `Io.set(Qbe, …)`, `doInitialize` |
+| F10 | Only `adoptCliSession` removes tombstones (`cx`), under the current login only. The record it creates is `local_<cliId>.json` with `createdAt`, `lastActivityAt` and `indexedAt` all set to the current time. | `adoptCliSession` |
+| F11 | The app ignores files in a partition that do not start with `local_` or `deleted_`. Record readers use plain `open`, so a file that briefly has two hard links is read normally. | every reader filters on the prefix; `nx`, `lx` |
+| F12 | With native multi-account mode (more than one signed-in account), a login change parks running sessions: they leave the loaded set and keep saving into their own partition. Logout followed by login does not park. | `onAccountOrgChanged`, `parked`, `storageDirFor` |
+| F13 | Bridge ids in a record are sent to the Remote Control API with the current login's token when such a session is archived or deleted, not at load. | `cleanupRemoteBridgeSessions` callers |
 
 ## Model
 
 - **Partition**: one enrolled directory (F1). Its **root** is the directory three levels up.
 - **Record**: `local_<id>.json`, id grammar `[A-Za-z0-9_-]+`. **Tombstone**: `deleted_<id>`.
-- **Normalised hash**: SHA-256 of the record parsed as JSON, minus volatile keys (`lastFocusedAt`, `processGoneReason`), serialised with sorted keys. Used only to decide whether two copies hold the same state. A record that is not a JSON object, or whose `sessionId` is not `local_<id>`, is **unreadable**.
-- **State** (`state.json`), per session id: `agreed`, the normalised hash at which every enrolled partition last held the same state; `deleted`, true once a delete reached every partition. Per partition: `seen`, ids observed there; `placing`, ids the tool was about to create there.
+- **Normalised hash**: SHA-256 of the record parsed as JSON, minus the volatile top-level keys `lastFocusedAt` and `errorAt` (F6), serialised with sorted keys as ASCII. Used only to decide whether two copies hold the same state. A record that is not a JSON object, whose `sessionId` is not `local_<id>`, or that the fingerprint cannot process for any reason, is **unreadable**.
+- **Activity**: the record's `lastActivityAt`, read as 0 when missing or malformed and never later than now.
+- **State** (`state.json`). Per session id: `agreed`, the normalised hash at which every enrolled partition last held the same state. Per partition: `seen`, ids observed there; `placing`, ids the tool was about to create there; `placed`, the hash the tool last put there for an id, remembered while that copy is untouched and not yet agreed.
+- A copy is **still as synced** when its hash equals `agreed` or the partition's `placed` hash.
 
 ## Rules
 
-**R1 Enrolment.** Only partitions listed in `config.json` are read or written. A path qualifies if it is a real directory shaped `<root>/claude-code-sessions/<uuid>/<uuid>` with no symlinked component below the root. Fewer than two enrolled partitions, or an enrolled partition that is missing, aborts the run. A directory with records that is not enrolled is reported and never touched.
+**R1 Enrolment.** Only partitions listed in `config.json` are read or written. A path qualifies if it is a real directory shaped `<root>/claude-code-sessions/<uuid>/<uuid>` with no symlinked component below the root. Fewer than two enrolled partitions, a missing one, or one directory enrolled under two spellings aborts the run. A directory with records that is not enrolled is reported and never touched.
 
-**R2 Copies are verbatim.** Every record the tool places is a byte-for-byte copy of a file the app wrote, with the source's mtime. The tool never edits or merges record contents.
+**R2 Copies are verbatim.** Every record the tool places is a byte-for-byte copy of a file the app wrote, with the source's mtime, and is verified to be the version the planner chose. The tool never edits or merges record contents.
 
-**R3 One side changed.** For an id with differing normalised hashes and a known `agreed`: if every partition that differs from `agreed` holds the same hash, that version replaces the copies still at `agreed`.
+**R3 One side changed.** When some copies are still as synced and every other copy holds one and the same new state, that state wins, provided its activity is not lower than that of any copy it would replace. A copy can also leave the synced state by going back in time (a restored backup, a promoted temp file, a login flushing stale memory); its activity is then lower, and the case is decided by R4.
 
-**R4 Both changed.** Otherwise (no `agreed`, or two different new versions) the copy with the greatest `lastActivityAt` wins and every replaced copy is kept (R8). If the top two are tied the id is left alone and reported. `--prefer PARTITION` resolves ties in favour of one partition.
+**R4 Both changed.** Otherwise the copy with the greatest activity wins. If the top copies are tied on activity and differ in state, the session is left alone and reported. `--prefer PARTITION`, optionally with `--session ID`, settles ties in favour of one partition.
 
-**R5 New records.** An id missing from a partition is created there unless R7 forbids it. Creation is allowed in a live partition, because the app cannot hold what it has never loaded.
+**R5 New records.** An id missing from a partition is created there unless R7 forbids it. Creation never overwrites: if a file has appeared at the target, the action is refused. Creation is allowed in a live partition, because the app cannot hold what it has never loaded.
 
-**R6 Deletes.** For an id with a tombstone anywhere and a record anywhere, let T be the newest tombstone time. The scanner never reports a time in the future: it falls back to the tombstone file's own time, clamped to now.
-- If `deleted` is true the record is a re-creation (F10): the record wins.
-- Else if some copy has `lastActivityAt` greater than T the session was used after the delete: the record wins.
-- Else the delete wins.
+**R6 Deletes.** For an id with a tombstone anywhere and a record anywhere, let T be the newest tombstone time. The scanner never reports a time in the future: it falls back to the tombstone file's own time, clamped to now. If some copy's activity is greater than T the session was used, or re-adopted (F10), after the delete, and the record wins. Otherwise the delete wins. Nothing is remembered about finished deletes, so nothing can be remembered wrongly.
 
-Delete wins: every copy and its `.tmp` sibling are retired (R8), and the tombstone is created wherever it is missing and no record remains. Record wins: the record propagates by R3 to R5 and the stale tombstones are retired. A tombstone with no record anywhere is created wherever it is missing.
+Delete wins: every copy, with its `.tmp` sibling first (F7), is retired, and the tombstone is created wherever it is missing and no record remains. An orphaned `.tmp` beside a tombstone is retired. Record wins: the record propagates by R3 to R5 and the stale tombstones are retired after it is in place. A tombstone with no record anywhere is created wherever it is missing.
 
-**R7 Lost records.** An id absent from a partition that is in that partition's `seen` or `placing`, with no tombstone anywhere, was removed there without a tombstone (F3 mid-delete, or a failed tombstone write). It is never recreated there. It is reported. `placing` entries last one run.
+**R7 Lost records.** An id absent from a partition that is in that partition's `seen` or `placing`, with no tombstone anywhere, was removed there without a tombstone (F3 mid-delete, or a failed tombstone write). It is never recreated there. It is reported, and `--recreate ID` lifts the hold for one session. `placing` entries last one run. An id gone from every partition is forgotten.
 
-**R8 Nothing unique is destroyed.** Before a file is replaced or removed, its bytes are copied to `kept/<run>/<account>_<org>/` when they differ from `agreed`, and always when retiring a record or a tombstone. Entries older than 30 days are pruned after a run with no failures.
+**R8 Nothing unique is destroyed.** A replaced copy is kept in `kept/<run>/<account>_<org>/` unless it is still as synced and the winner's activity is strictly greater. A retired record, temp file or tombstone is always kept. Kept files never overwrite each other, and the report names where each went. Kept runs are pruned after a run with no failures: older than 30 days, and oldest first above 500 MB.
 
-**R9 Write guards.** Changing or removing an existing file requires all of: the partition is not live (the app is running and the partition's account equals `lastKnownAccountUuid`, or that cannot be read), re-checked immediately before the change; and the file's stat equals the stat seen at scan. `pgrep` exit 0 means running, 1 means not running, anything else means running.
+**R9 Write guards.** Changing or removing an existing file requires that the partition is not live and that the file's stat equals the stat seen at scan. Both are checked before anything is written, and again after the new bytes are staged, immediately before the rename or unlink. While the app is running a partition is live if its account equals `lastKnownAccountUuid`, or that cannot be read, or the app's `config.json` was written in the last 120 seconds (F9: a login change may still be flushing the previous login's saves). `pgrep` exit 0 means running, 1 means not running, anything else means running.
 
-**R10 Crash safety.** State is loaded, then intents (`placing`) are saved before any write, then results after. Every file is written to a temporary name that starts with `.sync-` and renamed into place. Stale `.sync-` files are swept at start. SIGTERM unwinds through cleanup. A corrupt state file aborts the run; `--reset-state` starts again from first contact.
+**R10 Crash safety.** State is loaded, intents (`placing`) are saved before the first write, and results after. Every file is staged under a name that starts with `.sync-` and renamed or linked into place. Stale `.sync-` files are swept from the partitions and from the tool's own folders. SIGTERM unwinds through cleanup. A state file that cannot be trusted aborts the run; `--reset-state` keeps the old file and starts again from first contact.
 
-**R11 Unreadable copies.** An id with an unreadable copy anywhere is left alone everywhere and reported.
+**R11 Unreadable copies.** An id with an unreadable copy anywhere is left alone everywhere and reported. One odd record never stops a run.
 
-**R12 Unattended runs.** Quiet mode logs what was written, and standing problems once per change of the problem set. The log is capped. The agent watches the enrolled partitions and is rewritten when enrolment changes. `--status` shows the last successful run.
-
-## Why a parked session is safe (F12)
-
-A parked session saves into its own partition while another login is current. The tool would replace that file only if the other partition's copy of the same id changed. It cannot: the current login holds the parked session in memory and never loads its own copy. A delete of a parked session writes the tombstone into the parked partition; the other copy is in the live partition and waits for R9.
+**R12 Unattended runs.** A quiet run appends to its own log file: writes, kept copies, and standing problems or a standing abort once per change. The log is capped. The file launchd holds open receives only unexpected tracebacks. The agent watches the enrolled partitions, is rewritten when enrolment changes, and is removed when fewer than two remain. A refused action writes nothing, so a watched directory does not refire on it. `--status` tells a loaded agent from a plist that merely exists and warns when there has been no clean run for an hour.
 
 ## Non-goals
 
@@ -74,7 +69,10 @@ Cowork sessions, `scheduled-tasks.json`, `backlog/`, `archived-sessions.idx` (a 
 
 ## Known residual risks
 
-- Between the final stat check and the rename there is a window of microseconds in which the app could write the same file. The app's next save restores its memory state.
-- Deleting a synced session leaves its transcript on disk when the session was imported, because the other login's copy still claims it (app behaviour, F8 claim set).
-- Archiving or deleting, under one login, a session whose Remote Control link belongs to the other login sends that link's id with the wrong token (F13). The app ignores the failure.
-- Two app instances running at once can both change one session. R4 resolves it and keeps the loser.
+- **Native multi-account mode (F12).** If the app parks sessions, the new login loads its own synced copy of a parked id, and the app then routes saves for that id between the two partitions in ways this tool cannot see. The 120-second grace covers a login change, not a session parked for hours. This tool is for logout-and-login switching. If the app gains a native account switcher for you, stop using it.
+- **The last instant.** Between the final guard and the rename the app could write the same file. The window is the rename call itself. The app's next save restores its memory state.
+- **First contact.** With no sync history (the first run, or after `--reset-state`), a record the app removed seconds ago, before writing its tombstone, can be put back once. The next run sees the tombstone and retires it again, because its activity predates the delete.
+- **Imported sessions.** Deleting a synced session that was imported leaves its transcript on disk, because the other login's copy still claims it (app behaviour).
+- **Remote Control.** Archiving or deleting, under one login, a session whose Remote Control link belongs to the other login sends that link's id with the wrong token (F13). The app ignores the failure.
+- **Two app instances at once** can both change one session. R4 resolves it and keeps the loser.
+- **Changes without activity** (a rename, an archive, PR status the app refreshes) keep the replaced copy every time they propagate. The size cap bounds the cost; watch `kept/` in the first days.

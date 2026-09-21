@@ -64,13 +64,13 @@ class FirstContactAndSteadyState(RunTest):
         self.assertEqual(self.names(self.box.state_dir), before)
 
 
-class ReviewerScenarios(RunTest):
+class HardSequences(RunTest):
     def synced(self, **fields):
         write_record(self.box.a, X, activity=100, title="agreed", **fields)
         self.sync()
         self.assertTrue(self.in_sync())
 
-    def test_p1_a_clicked_stale_copy_does_not_overwrite_real_work(self):
+    def test_a_clicked_stale_copy_does_not_overwrite_real_work(self):
         self.synced()
         write_record(self.box.b, X, at_s=LONG_AGO_S + 50, activity=500, title="real work under B",
                      cliSessionId="rotated")
@@ -81,6 +81,34 @@ class ReviewerScenarios(RunTest):
         self.assertEqual(title_of(self.box.a, X), "real work under B")
         self.assertEqual(title_of(self.box.b, X), "real work under B")
         self.assertEqual(self.kept(), [], "the clicked copy held nothing beyond the agreed state")
+
+    def test_a_copy_that_went_back_to_an_older_state_does_not_take_the_newer_work_with_it(self):
+        # Work under B reaches A. Then A's file goes back in time: a restored backup, a promoted
+        # temp file, or the previous login flushing stale memory over what the tool had placed.
+        self.synced()
+        write_record(self.box.b, X, at_s=LONG_AGO_S + 50, activity=900, title="real work", cliSessionId="rotated")
+        self.sync()
+        self.assertTrue(self.in_sync())
+        write_record(self.box.a, X, at_s=LONG_AGO_S + 99, activity=100, title="agreed")
+
+        self.sync()
+
+        self.assertEqual(title_of(self.box.b, X), "real work")
+        self.assertEqual(title_of(self.box.a, X), "real work")
+        kept = [json.loads(p.read_text())["title"] for p in self.settings.kept_root.rglob("local_%s.json" % X)]
+        self.assertEqual(kept, ["agreed"], "the copy that went back is kept too, never just dropped")
+
+    def test_a_record_holding_half_an_emoji_does_not_stop_the_run(self):
+        # The app cuts strings by UTF-16 code unit, so a record can hold a lone surrogate.
+        path = self.box.a / ("local_%s.json" % X)
+        path.write_bytes(b'{"sessionId": "local_%s", "title": "done \\ud83d", "lastActivityAt": 5}' % X.encode())
+        write_record(self.box.a, Y)
+
+        report = self.sync()
+
+        self.assertEqual(report.failures, [])
+        self.assertEqual((self.box.b / path.name).read_bytes(), path.read_bytes())
+        self.assertTrue((self.box.b / ("local_%s.json" % Y)).exists())
 
     def test_real_work_on_both_sides_keeps_the_losing_copy(self):
         self.synced()
@@ -93,7 +121,7 @@ class ReviewerScenarios(RunTest):
         kept = list(self.settings.kept_root.rglob("local_%s.json" % X))
         self.assertEqual([json.loads(p.read_text())["title"] for p in kept], ["work under A"])
 
-    def test_p9_a_click_does_not_undo_a_delete(self):
+    def test_a_click_does_not_undo_a_delete(self):
         self.synced()
         (self.box.b / ("local_%s.json" % X)).unlink()
         write_tombstone(self.box.b, X, deleted_at_ms=NOW_MS)
@@ -109,7 +137,7 @@ class ReviewerScenarios(RunTest):
         self.assertNotIn(X, remembered.agreed)
         self.assertEqual(remembered.seen, {str(self.box.a): set(), str(self.box.b): set()})
 
-    def test_p6_a_record_removed_before_its_tombstone_is_written_is_not_put_back(self):
+    def test_a_record_removed_before_its_tombstone_is_written_is_not_put_back(self):
         self.synced()
         self.running = True
         self.box.logged_in_as(ACCOUNT_B)
@@ -193,6 +221,44 @@ class ReviewerScenarios(RunTest):
         self.assertEqual(len(self.kept()), 1)
 
 
+class ThreePartitions(RunTest):
+    def test_a_second_change_after_partial_propagation_still_gets_through(self):
+        third = self.box.partition("cccccccc-0000-4000-8000-000000000003", "cccccccc-0000-4000-8000-0000000000c3")
+        enrol(self.settings.config_path, third)
+        write_record(self.box.a, X, activity=100, title="v0")
+        self.sync()
+        self.running = True
+        self.box.logged_in_as("cccccccc-0000-4000-8000-000000000003")
+        write_record(self.box.a, X, at_s=LONG_AGO_S + 50, activity=500, title="first change")
+        self.sync()
+        self.assertEqual(title_of(self.box.b, X), "first change")
+        self.assertEqual(title_of(third, X), "v0")
+
+        write_record(self.box.a, X, at_s=LONG_AGO_S + 60, activity=500, title="renamed, no new activity")
+        report = self.sync()
+
+        self.assertEqual(title_of(self.box.b, X), "renamed, no new activity")
+        self.assertEqual({p.kind for p in report.problems}, {"live"})
+
+        self.running = False
+        self.sync()
+        self.assertEqual(title_of(third, X), "renamed, no new activity")
+        self.assertTrue(self.in_sync())
+
+
+class OrphanedTempFiles(RunTest):
+    def test_a_temp_file_left_beside_a_finished_delete_is_moved_aside(self):
+        # At startup the app promotes an orphaned temp file to a live record, tombstone or not.
+        for side in (self.box.a, self.box.b):
+            write_tombstone(side, X, deleted_at_ms=NOW_MS)
+        (self.box.a / ("local_%s.json.tmp" % X)).write_text('{"half": "a save"}')
+
+        self.sync()
+
+        self.assertEqual(self.names(self.box.a), ["deleted_%s" % X])
+        self.assertEqual(self.kept(), ["local_%s.json.tmp" % X])
+
+
 class LivePartitions(RunTest):
     def test_the_live_partition_gains_new_records_but_keeps_its_own_versions(self):
         write_record(self.box.a, X, activity=100, title="agreed")
@@ -236,6 +302,15 @@ class SafetyNets(RunTest):
 
         self.assertIn(str(self.box.b), str(raised.exception))
         self.assertEqual(self.names(self.box.a), ["local_%s.json" % X])
+
+    def test_one_directory_listed_twice_would_be_synced_with_itself_so_the_run_stops(self):
+        self.settings.config_path.write_text(json.dumps({"partitions": [str(self.box.a), str(self.box.a)]}))
+        write_record(self.box.a, X)
+
+        with self.assertRaises(RunAborted) as raised:
+            self.sync()
+
+        self.assertIn("same directory", str(raised.exception))
 
     def test_one_enrolled_partition_is_not_enough(self):
         from session_sync.enrolment import unenrol
@@ -295,6 +370,42 @@ class SafetyNets(RunTest):
 
         self.assertFalse(old.parent.exists())
         self.assertEqual(load_state(self.settings.state_path).last_success_ms, self.clock_s * 1000)
+
+    def test_kept_copies_are_bounded_by_size_as_well_as_age(self):
+        import session_sync.run as module
+        for name, age_days in (("20260101-000000", 3), ("20260102-000000", 2), ("20260103-000000", 1)):
+            folder = self.settings.kept_root / name
+            folder.mkdir(parents=True)
+            (folder / "local_big.json").write_bytes(b"x" * 1000)
+            os.utime(folder, ns=((self.clock_s - age_days * 86400) * SECOND_NS,) * 2)
+        write_record(self.box.a, X)
+
+        with mock.patch.object(module, "KEPT_MAX_BYTES", 2500):
+            self.sync()
+
+        self.assertEqual(sorted(p.name for p in self.settings.kept_root.iterdir()),
+                         ["20260102-000000", "20260103-000000"], "the oldest run goes first")
+
+    def test_stale_temp_files_are_swept_from_the_tools_own_folders_too(self):
+        self.settings.kept_root.mkdir(parents=True)
+        strays = [self.box.state_dir / ".sync-1-state.json.part", self.settings.kept_root / ".sync-1-x.part"]
+        for stray in strays:
+            stray.write_text("x")
+            os.utime(stray, ns=((self.clock_s - 3600) * SECOND_NS,) * 2)
+
+        self.sync()
+
+        self.assertEqual([stray.exists() for stray in strays], [False, False])
+
+    def test_an_idle_run_does_not_rewrite_the_state_file(self):
+        write_record(self.box.a, X)
+        self.sync()
+        self.sync()
+        before = os.lstat(self.settings.state_path).st_mtime_ns
+
+        self.sync()
+
+        self.assertEqual(os.lstat(self.settings.state_path).st_mtime_ns, before)
 
     def test_a_run_with_failures_neither_prunes_nor_claims_success(self):
         old = self.settings.kept_root / "20200101-000000"

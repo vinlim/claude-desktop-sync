@@ -31,6 +31,7 @@ def render(report: RunReport, verbose: bool = False, quiet: bool = False,
         shown = [o.action for o in report.done] if report.applied else report.planned
         lines += ["  %s" % _describe(action) for action in shown]
     lines += _count_lines(report)
+    lines += _kept_lines(report)
     lines += standing
     lines += ["Not enrolled, so left alone: %s (%d records). Add it with --enroll PATH if it is yours to sync."
               % (path, count) for path, count in sorted(report.unenrolled.items())]
@@ -42,7 +43,7 @@ def render(report: RunReport, verbose: bool = False, quiet: bool = False,
 
 
 def _quiet_text(report: RunReport, standing: List[str], digest: str, previous_digest: str) -> str:
-    lines = _count_lines(report) if report.done else []
+    lines = _count_lines(report) + _kept_lines(report) if report.done else []
     if digest != previous_digest:
         lines += standing or ["earlier problems cleared"]
     return "\n".join(lines)
@@ -56,6 +57,12 @@ def _count_lines(report: RunReport) -> List[str]:
         counts[key] = counts.get(key, 0) + 1
     word = "done   " if report.applied else "planned"
     return ["%s %5d  %s" % (word, counts[key], key) for key in sorted(counts)]
+
+
+def _kept_lines(report: RunReport) -> List[str]:
+    """R8: whatever was replaced or retired with something unique in it, and where it went."""
+    return ["kept the previous copy of %s from %s: %s" % (o.action.session_id, label(Path(o.action.target)), o.kept)
+            for o in report.done if o.kept is not None]
 
 
 def _standing_lines(report: RunReport) -> List[str]:

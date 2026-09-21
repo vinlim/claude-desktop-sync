@@ -31,9 +31,13 @@ class Sandbox:
         path.mkdir(parents=True, mode=0o700)
         return path
 
-    def logged_in_as(self, account, root=None):
-        (root or self.root).mkdir(parents=True, exist_ok=True)
-        ((root or self.root) / "config.json").write_text(json.dumps({"lastKnownAccountUuid": account}))
+    def logged_in_as(self, account, root=None, at_s=None):
+        """at_s is when the app last wrote its config: long ago unless a test says otherwise."""
+        config = (root or self.root) / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"lastKnownAccountUuid": account}))
+        written = (LONG_AGO_S if at_s is None else at_s) * SECOND_NS
+        os.utime(config, ns=(written, written))
 
 
 def write_record(directory, session_id, at_s=LONG_AGO_S, activity=100, **fields):

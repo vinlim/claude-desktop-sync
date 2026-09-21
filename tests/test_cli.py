@@ -3,11 +3,12 @@ import io
 import os
 import signal
 import unittest
+from pathlib import Path
 
 from session_sync.cli import Environment, install_sigterm_handler, main
 from session_sync.run import Settings
 from session_sync.state_store import load_state
-from tests.fs_helpers import ACCOUNT_B, LONG_AGO_S, SECOND_NS, Sandbox, X, title_of, write_record
+from tests.fs_helpers import ACCOUNT_B, LONG_AGO_S, SECOND_NS, Sandbox, X, Y, title_of, write_record
 
 
 class CliTest(unittest.TestCase):
@@ -17,13 +18,26 @@ class CliTest(unittest.TestCase):
         self.settings = Settings(state_dir=self.box.state_dir)
         self.running = False
         self.clock_s = LONG_AGO_S + 100_000
+        self.plist = self.box.base / "LaunchAgents" / "agent.plist"
+        self.launchctl_calls = []
+        self.agent_is_loaded = True
+
+    def launchctl(self, command, **kwargs):
+        """Stands in for launchd, so no test can touch the real one."""
+        from types import SimpleNamespace
+        self.launchctl_calls.append(command[1])
+        return SimpleNamespace(returncode=0 if command[1] != "print" or self.agent_is_loaded else 113, stderr="")
+
+    def pretend_the_agent_is_installed(self):
+        self.plist.parent.mkdir(parents=True, exist_ok=True)
+        self.plist.write_bytes(b"plist")
 
     def run_cli(self, *argv):
         self.clock_s += 10
         out = io.StringIO()
         env = Environment(settings=self.settings, out=out, now_ns=lambda: self.clock_s * SECOND_NS,
                           running=lambda: self.running, sessions_dir=self.box.root / "claude-code-sessions",
-                          agent_plist=self.box.base / "LaunchAgents" / "agent.plist")
+                          agent_plist=self.plist, launchctl=self.launchctl, quiet_out=out)
         return main(list(argv), env), out.getvalue()
 
     def enrol_both(self):
@@ -117,6 +131,102 @@ class Running(CliTest):
         self.assertEqual(list(self.box.b.iterdir()), [])
 
 
+class StandingProblems(CliTest):
+    def test_a_standing_abort_is_logged_once_with_a_timestamp(self):
+        _, first = self.run_cli("--apply", "--quiet")
+        _, second = self.run_cli("--apply", "--quiet")
+
+        self.assertRegex(first, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\n")
+        self.assertIn("at least two", first)
+        self.assertEqual(second, "")
+
+    def test_the_same_abort_is_logged_again_after_a_run_that_worked(self):
+        self.run_cli("--enroll", str(self.box.a))
+        _, first = self.run_cli("--apply", "--quiet")
+        self.run_cli("--enroll", str(self.box.b))
+        self.run_cli("--apply", "--quiet")
+        self.run_cli("--unenroll", str(self.box.b))
+
+        _, again = self.run_cli("--apply", "--quiet")
+
+        self.assertIn("1 partition(s) enrolled", first)
+        self.assertEqual(again.splitlines()[1:], first.splitlines()[1:], "word for word the abort that was logged before")
+
+    def test_a_lost_record_can_be_recreated_for_one_session(self):
+        self.enrol_both()
+        write_record(self.box.a, X)
+        self.run_cli("--apply")
+        (self.box.b / ("local_%s.json" % X)).unlink()
+        self.assertIn("not recreated", self.run_cli("--apply")[1])
+
+        code, text = self.run_cli("--recreate", X)
+        self.run_cli("--apply")
+
+        self.assertEqual(code, 0)
+        self.assertIn(X, text)
+        self.assertEqual(title_of(self.box.b, X), "t")
+
+    def test_prefer_can_settle_one_session_and_leave_the_other_tied(self):
+        self.enrol_both()
+        for sid in (X, Y):
+            write_record(self.box.a, sid, activity=100, title="agreed")
+        self.run_cli("--apply")
+        for sid in (X, Y):
+            write_record(self.box.a, sid, at_s=LONG_AGO_S + 50, activity=100, title="renamed under A")
+            write_record(self.box.b, sid, at_s=LONG_AGO_S + 60, activity=100, title="agreed", isArchived=True)
+
+        self.run_cli("--apply", "--prefer", str(self.box.a), "--session", X)
+
+        self.assertEqual(title_of(self.box.b, X), "renamed under A")
+        self.assertEqual(title_of(self.box.b, Y), "agreed")
+
+
+class UnattendedLog(CliTest):
+    def test_a_quiet_run_appends_to_its_own_log_file(self):
+        # The tool writes and caps this file itself, so nothing depends on how launchd opened it.
+        self.enrol_both()
+        write_record(self.box.a, X)
+        out = io.StringIO()
+        env = Environment(settings=self.settings, out=out, now_ns=lambda: self.clock_s * SECOND_NS,
+                          running=lambda: False, sessions_dir=self.box.root / "claude-code-sessions",
+                          agent_plist=self.plist, launchctl=self.launchctl)
+
+        main(["--apply", "--quiet"], env)
+
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("create record", self.settings.log_path.read_text())
+
+
+class AgentUpkeep(CliTest):
+    def test_unenrolling_below_two_partitions_removes_the_agent(self):
+        self.enrol_both()
+        self.pretend_the_agent_is_installed()
+
+        _, text = self.run_cli("--unenroll", str(self.box.b))
+
+        self.assertFalse(self.plist.exists())
+        self.assertIn("bootout", self.launchctl_calls)
+        self.assertIn("agent was removed", text)
+
+    def test_status_tells_an_agent_that_is_loaded_from_one_that_only_has_a_file(self):
+        self.enrol_both()
+        self.pretend_the_agent_is_installed()
+        self.assertIn("background agent: installed and loaded", self.run_cli("--status")[1])
+
+        self.agent_is_loaded = False
+
+        self.assertIn("installed but not loaded", self.run_cli("--status")[1])
+
+    def test_status_warns_when_an_installed_agent_has_not_had_a_clean_run_for_a_while(self):
+        self.enrol_both()
+        write_record(self.box.a, X)
+        self.run_cli("--apply")
+        self.pretend_the_agent_is_installed()
+        self.clock_s += 7200
+
+        self.assertIn("no clean run for", self.run_cli("--status")[1])
+
+
 class Housekeeping(CliTest):
     def test_reset_state_keeps_the_old_file_aside(self):
         self.enrol_both()
@@ -129,6 +239,7 @@ class Housekeeping(CliTest):
         self.assertFalse(self.settings.state_path.exists())
         self.assertEqual(len(list(self.box.state_dir.glob("state.json.before-reset-*"))), 1)
         self.assertIn("kept as", text)
+        self.assertIn("lastActivityAt", text, "the message says how the next run will decide")
 
     def test_status_reports_the_last_clean_run_and_standing_problems(self):
         self.enrol_both()
@@ -142,16 +253,31 @@ class Housekeeping(CliTest):
         self.assertIn("last clean run: 10 seconds ago", text)
         self.assertIn("background agent: not installed", text)
 
-    def test_sigterm_unwinds_so_temp_files_are_cleaned_up(self):
-        previous = signal.getsignal(signal.SIGTERM)
-        self.addCleanup(signal.signal, signal.SIGTERM, previous)
-        install_sigterm_handler()
+    def test_sigterm_in_the_middle_of_a_write_leaves_no_staged_file_behind(self):
+        # launchd stops an agent with SIGTERM. The child below stages a file, then waits inside the rename.
+        import subprocess
+        import sys
+        import time as real_time
+        target = self.box.a / ("local_%s.json" % X)
+        child = subprocess.Popen([sys.executable, "-c", (
+            "import os, sys, time\n"
+            "sys.path.insert(0, %r)\n"
+            "from pathlib import Path\n"
+            "import session_sync.atomic as atomic\n"
+            "from session_sync.cli import install_sigterm_handler\n"
+            "install_sigterm_handler()\n"
+            "atomic.os.replace = lambda *a: time.sleep(30)\n"
+            "atomic.write_atomic(Path(%r), b'payload')\n") % (str(Path(__file__).resolve().parent.parent), str(target))])
+        self.addCleanup(child.kill)
+        deadline = real_time.time() + 10
+        while not any(p.name.startswith(".sync-") for p in self.box.a.iterdir()):
+            self.assertLess(real_time.time(), deadline, "the child never staged its file")
+            real_time.sleep(0.02)
 
-        with self.assertRaises(SystemExit) as raised:
-            os.kill(os.getpid(), signal.SIGTERM)
-            signal.pause()
+        child.send_signal(signal.SIGTERM)
 
-        self.assertEqual(raised.exception.code, 143)
+        self.assertEqual(child.wait(timeout=10), 143)
+        self.assertEqual(list(self.box.a.iterdir()), [])
 
 
 if __name__ == "__main__":

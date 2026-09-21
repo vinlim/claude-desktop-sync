@@ -1,6 +1,7 @@
 import os
 import stat
 import unittest
+from unittest import mock
 
 from session_sync.applier import Applier
 from session_sync.model import (CreateRecord, CreateTombstone, Plan, ReplaceRecord, RetireRecord, RetireTmp,
@@ -109,7 +110,7 @@ class ReplacingARecord(ApplierTest):
         self.assertEqual(stat.S_IMODE(os.lstat(kept).st_mode), 0o600)
 
     def test_a_partition_that_became_live_is_left_alone(self):
-        # The reviewer's M2(a): liveness is asked again at the moment of the write.
+        # liveness is asked again at the moment of the write.
         write_record(self.box.a, X, title="new")
         write_record(self.box.b, X, title="old")
         applier = self.prepare()
@@ -131,6 +132,87 @@ class ReplacingARecord(ApplierTest):
 
         self.assertIn("target changed", outcomes[0].problem)
         self.assertEqual(title_of(self.box.b, X), "app saved meanwhile")
+
+
+class GuardTiming(ApplierTest):
+    def test_the_last_guard_runs_after_the_new_bytes_are_staged(self):
+        # Writing and syncing the staged file takes milliseconds. A guard before that
+        # would miss a save the app makes meanwhile.
+        write_record(self.box.a, X, title="new")
+        write_record(self.box.b, X, title="old")
+        applier = self.prepare()
+        import session_sync.applier as module
+        real_stage = module.stage
+
+        def app_saves_while_we_stage(destination, data, mtime_ns=None):
+            staged = real_stage(destination, data, mtime_ns)
+            write_record(self.box.b, X, at_s=LONG_AGO_S + 9, title="app saved meanwhile")
+            return staged
+
+        with mock.patch.object(module, "stage", app_saves_while_we_stage):
+            outcomes = applier.apply(Plan(actions=[ReplaceRecord(X, source=self.A, target=self.B, keep=False)]))
+
+        self.assertIn("target changed", outcomes[0].problem)
+        self.assertEqual(title_of(self.box.b, X), "app saved meanwhile")
+        self.assertEqual(self.names(self.box.b), ["local_%s.json" % X], "the staged file is discarded")
+
+    def test_a_file_that_appears_between_the_check_and_the_link_is_still_never_overwritten(self):
+        write_record(self.box.a, X, title="from A")
+        applier = self.prepare()
+        import session_sync.applier as module
+        real_stage = module.stage
+
+        def app_creates_it_while_we_stage(destination, data, mtime_ns=None):
+            staged = real_stage(destination, data, mtime_ns)
+            write_record(self.box.b, X, title="the app made this meanwhile")
+            return staged
+
+        with mock.patch.object(module, "stage", app_creates_it_while_we_stage):
+            outcomes = applier.apply(Plan(actions=[CreateRecord(X, source=self.A, target=self.B)]))
+
+        self.assertIn("appeared", outcomes[0].problem)
+        self.assertEqual(title_of(self.box.b, X), "the app made this meanwhile")
+        self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
+
+    def test_a_refused_action_writes_nothing_so_a_watched_directory_does_not_refire(self):
+        write_record(self.box.a, X)
+        write_record(self.box.a, Y, title="new")
+        applier = self.prepare()
+        write_record(self.box.b, X, title="appeared")
+        write_record(self.box.b, Y, at_s=LONG_AGO_S + 9, title="changed")
+        before = os.lstat(self.box.b).st_mtime_ns
+
+        outcomes = applier.apply(Plan(actions=[CreateRecord(X, source=self.A, target=self.B),
+                                               ReplaceRecord(Y, source=self.A, target=self.B, keep=True)]))
+
+        self.assertTrue(all(outcome.problem for outcome in outcomes))
+        self.assertEqual(os.lstat(self.box.b).st_mtime_ns, before)
+        self.assertEqual(self.kept_files(), [])
+
+
+class KeptCopies(ApplierTest):
+    def test_the_outcome_says_where_the_replaced_copy_went(self):
+        write_record(self.box.a, X, title="winner")
+        write_record(self.box.b, X, title="loser")
+        write_record(self.box.a, Y)
+
+        replaced, created = self.apply(ReplaceRecord(X, source=self.A, target=self.B, keep=True),
+                                       CreateRecord(Y, source=self.A, target=self.B))
+
+        self.assertIn('"loser"', replaced.kept.read_text())
+        self.assertIsNone(created.kept)
+
+    def test_two_kept_versions_of_one_file_never_overwrite_each_other(self):
+        write_record(self.box.a, X, title="winner")
+        write_record(self.box.b, X, title="first loser")
+        self.apply(ReplaceRecord(X, source=self.A, target=self.B, keep=True))
+        write_record(self.box.b, X, at_s=LONG_AGO_S + 9, title="second loser")
+
+        self.apply(ReplaceRecord(X, source=self.A, target=self.B, keep=True))
+
+        kept = [p.read_text() for p in sorted(self.kept.rglob("local_*")) if p.is_file()]
+        self.assertEqual(len(kept), 2)
+        self.assertTrue(any("first loser" in text for text in kept) and any("second loser" in text for text in kept))
 
 
 class RetiringARecord(ApplierTest):

@@ -54,7 +54,7 @@ class OneSideChanged(unittest.TestCase):
         self.assertEqual(result.actions, [ReplaceRecord(X, source="B", target="A", keep=True)])
 
     def test_mtime_plays_no_part_so_a_clicked_stale_copy_never_wins(self):
-        # The reviewer's B1: work under B, then only click X under A. A click
+        # work under B, then only click X under A. A click
         # changes no normalised state, so A still equals the agreed hash.
         result = planned([snapshot("A", {X: copy("v1", activity=10)}),
                           snapshot("B", {X: copy("v2", activity=50)})],

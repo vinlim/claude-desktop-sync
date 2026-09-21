@@ -9,13 +9,16 @@ from session_sync.model import (CreateRecord, CreateTombstone, Plan, Problem, Re
                                 RetireTombstone, Snapshot, SyncState)
 
 
-def plan(snapshots: List[Snapshot], state: SyncState, live: Set[str], prefer: Optional[str] = None) -> Plan:
+def plan(snapshots: List[Snapshot], state: SyncState, live: Set[str], prefer: Optional[str] = None,
+         prefer_session: Optional[str] = None) -> Plan:
+    """prefer settles ties in favour of one partition, for one session if prefer_session is given."""
     result = Plan()
     session_ids = set()
     for snapshot in snapshots:
         session_ids.update(snapshot.records, snapshot.tombstones, snapshot.orphan_tmps)
     for session_id in sorted(session_ids):
-        _plan_session(session_id, snapshots, state, live, prefer, result)
+        preferred = prefer if prefer_session in (None, session_id) else None
+        _plan_session(session_id, snapshots, state, live, preferred, result)
     return result
 
 
@@ -112,7 +115,7 @@ def _one_sided_winner(session_id: str, holders: List[Snapshot], untouched: List[
     if len({s.records[session_id].state_hash for s in holders}) == 1:
         return holders[0]
     changed = [s for s in holders if s not in untouched]
-    if not untouched or len({s.records[session_id].state_hash for s in changed}) != 1:
+    if len({s.records[session_id].state_hash for s in changed}) != 1:
         return None
     candidate = changed[0]
     behind = any(candidate.records[session_id].last_activity_at < s.records[session_id].last_activity_at

@@ -50,6 +50,16 @@ class Enrolment(unittest.TestCase):
         stored = json.loads(self.config.read_text())["partitions"]
         self.assertEqual(stored, [str(self.box.a)])
 
+    def test_one_directory_cannot_be_enrolled_twice_under_another_spelling(self):
+        shouting = self.box.a.parent.parent / self.box.a.parent.name.upper() / self.box.a.name
+        enrol(self.config, self.box.a)
+        try:
+            enrol(self.config, shouting)
+        except EnrolmentError:
+            pass  # a case-sensitive volume: the other spelling is simply another, missing, directory
+
+        self.assertEqual(load_enrolled(self.config), [self.box.a])
+
     def test_a_config_that_cannot_be_read_stops_the_run(self):
         self.config.parent.mkdir(parents=True)
         for content in ("{", "[]", '{"partitions": "nope"}'):
@@ -59,7 +69,7 @@ class Enrolment(unittest.TestCase):
                     load_enrolled(self.config)
 
     def test_directories_with_records_that_are_not_enrolled_are_found(self):
-        # The reviewer's M3: a third login must be noticed, never merged on its own.
+        # a third login must be noticed, never merged on its own.
         third = self.box.partition("cccccccc-0000-4000-8000-000000000003", "cccccccc-0000-4000-8000-0000000000c3")
         write_record(third, X)
         self.box.partition(ACCOUNT_A, ORG_B)  # an empty cross-pair

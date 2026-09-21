@@ -1,5 +1,6 @@
 """Whether the running app may hold a partition in memory (DESIGN.md R9)."""
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -7,6 +8,10 @@ from typing import Optional
 # The main binary only. Helper processes live under Contents/Frameworks.
 APP_PROCESS = r"Claude\.app/Contents/MacOS/Claude( |$)"
 PGREP_TIMEOUT_S = 5
+
+# The app records the new login before it flushes the previous login's pending saves
+# (DESIGN.md F9), so right after its config is written no partition is safe to change.
+SWITCH_GRACE_S = 120
 
 
 def app_running(run=subprocess.run) -> bool:
@@ -27,9 +32,20 @@ def last_known_account(root: Path) -> Optional[str]:
     return value.lower() if isinstance(value, str) else None
 
 
-def is_live(partition: Path, running: bool) -> bool:
+def is_live(partition: Path, running: bool, now_ns: int) -> bool:
     """A partition is <root>/claude-code-sessions/<account>/<org>."""
     if not running:
         return False
-    account = last_known_account(partition.parents[2])
-    return account is None or account == partition.parent.name.lower()
+    root = partition.parents[2]
+    account = last_known_account(root)
+    if account is None or account == partition.parent.name.lower():
+        return True
+    return _config_written_recently(root, now_ns)
+
+
+def _config_written_recently(root: Path, now_ns: int) -> bool:
+    try:
+        written_ns = os.lstat(root / "config.json").st_mtime_ns
+    except OSError:
+        return True
+    return now_ns - written_ns < SWITCH_GRACE_S * 1_000_000_000  # a future time counts as just written

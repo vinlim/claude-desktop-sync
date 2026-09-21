@@ -70,6 +70,19 @@ class NormalOutput(unittest.TestCase):
         self.assertIn("--enroll", text)
 
 
+class KeptCopies(unittest.TestCase):
+    def test_a_resolved_conflict_names_where_the_losing_copy_went(self):
+        from session_sync.model import ReplaceRecord
+        kept = Path("/state/kept/20260921-120000/b_b/local_%s.json" % X)
+        resolved = Outcome(ReplaceRecord(X, str(A), str(B), keep=True), None, kept=kept)
+
+        normal, _ = render(report(applied=True, outcomes=[resolved]))
+        quiet, _ = render(report(applied=True, outcomes=[resolved]), quiet=True)
+
+        for text in (normal, quiet):
+            self.assertIn("kept the previous copy of %s from bbbbbbbb/bbbbbbbb: %s" % (X, kept), text)
+
+
 class QuietOutput(unittest.TestCase):
     """R12: an unattended log records changes, and a standing problem only once."""
 

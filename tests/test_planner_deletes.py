@@ -25,7 +25,7 @@ class DeleteWins(unittest.TestCase):
         self.assertEqual(result.problems, [])
 
     def test_a_click_on_the_stale_copy_does_not_undo_the_delete(self):
-        # The reviewer's M1: the clicked copy has a newer file and even a new
+        # the clicked copy has a newer file and even a new
         # state, but nobody used the session after it was deleted.
         result = planned([snapshot("A", {X: copy("clicked", activity=DELETED_AT - 5)}),
                           snapshot("B", tombstones={X: DELETED_AT})], state(agreed={X: "v1"}))

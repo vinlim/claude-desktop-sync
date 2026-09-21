@@ -33,7 +33,12 @@ def choose_python(candidates: Sequence[str], run=subprocess.run) -> str:
                      % ", ".join(candidates))
 
 
+def crash_log(log_path: Path) -> Path:
+    return log_path.with_name("agent-crash.log")
+
+
 def agent_definition(python: str, entry_script: Path, partitions: List[Path], log_path: Path) -> dict:
+    """A quiet run writes log_path itself. launchd's handle only ever receives an unexpected traceback."""
     return {
         "Label": LABEL,
         "ProgramArguments": [python, str(entry_script), "--apply", "--quiet"],
@@ -44,8 +49,8 @@ def agent_definition(python: str, entry_script: Path, partitions: List[Path], lo
         "ThrottleInterval": 10,
         "RunAtLoad": True,
         "ProcessType": "Background",
-        "StandardOutPath": str(log_path),
-        "StandardErrorPath": str(log_path),
+        "StandardOutPath": str(crash_log(log_path)),
+        "StandardErrorPath": str(crash_log(log_path)),
     }
 
 
@@ -53,20 +58,30 @@ def is_installed(plist: Path = PLIST) -> bool:
     return plist.exists()
 
 
-def install(entry_script: Path, partitions: List[Path], log_path: Path, plist: Path = PLIST) -> None:
+def is_loaded(launchctl=subprocess.run) -> bool:
+    """A plist on disk says nothing about whether launchd is running the agent."""
+    try:
+        return launchctl(["launchctl", "print", "gui/%d/%s" % (os.getuid(), LABEL)],
+                         capture_output=True, text=True).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def install(entry_script: Path, partitions: List[Path], log_path: Path, plist: Path = PLIST,
+            launchctl=subprocess.run) -> None:
     definition = agent_definition(choose_python(default_python_candidates()), entry_script, partitions, log_path)
-    uninstall(plist)
+    uninstall(plist, launchctl)
     plist.parent.mkdir(parents=True, exist_ok=True)
     with open(plist, "wb") as handle:
         plistlib.dump(definition, handle)
-    loaded = subprocess.run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(plist)],
-                            capture_output=True, text=True)
+    loaded = launchctl(["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(plist)],
+                       capture_output=True, text=True)
     if loaded.returncode:
         raise AgentError("launchctl could not load %s: %s" % (plist, loaded.stderr.strip()))
 
 
-def uninstall(plist: Path = PLIST) -> bool:
-    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LABEL)], capture_output=True)
+def uninstall(plist: Path = PLIST, launchctl=subprocess.run) -> bool:
+    launchctl(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LABEL)], capture_output=True, text=True)
     if not plist.exists():
         return False
     plist.unlink()

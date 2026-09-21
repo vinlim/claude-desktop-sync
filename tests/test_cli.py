@@ -69,6 +69,22 @@ class Enrolling(CliTest):
         self.assertNotIn("enrolled      %s" % self.box.a, self.run_cli("--list")[1])
 
 
+    def test_changing_the_enrolment_waits_for_a_run_in_flight_and_gives_up_politely(self):
+        # A run reads the enrolment under the lock, so once --unenroll returns none works from the old set.
+        from session_sync.enrolment import load_enrolled
+        self.run_cli("--enroll", str(self.box.a))
+        with open(self.settings.lock_path, "a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+
+            enroll = self.run_cli("--enroll", str(self.box.b))
+            unenroll = self.run_cli("--unenroll", str(self.box.a))
+
+        for code, text in (enroll, unenroll):
+            self.assertEqual(code, 2)
+            self.assertIn("sync is running", text)
+        self.assertEqual(load_enrolled(self.settings.config_path), [self.box.a])
+
+
 class Running(CliTest):
     def test_the_default_is_a_dry_run_and_apply_writes(self):
         self.enrol_both()
@@ -251,6 +267,30 @@ class AgentUpkeep(CliTest):
         self.assertFalse(self.plist.exists())
         self.assertIn("bootout", self.launchctl_calls)
         self.assertIn("agent was removed", text)
+
+    def test_the_agent_is_restarted_with_the_enrolment_lock_released(self):
+        # The agent runs at load, and a lock still held at that moment would turn its first run away.
+        self.enrol_both()
+        self.pretend_the_agent_is_installed()
+        third = self.box.partition("cccccccc-0000-4000-8000-000000000003", "cccccccc-0000-4000-8000-0000000000c3")
+        answer, lock_was_free = self.launchctl, []
+
+        def launchctl(command, **kwargs):
+            if command[1] == "bootstrap":
+                with open(self.settings.lock_path, "a") as probe:
+                    try:
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        lock_was_free.append(True)
+                    except OSError:
+                        lock_was_free.append(False)
+            return answer(command, **kwargs)
+
+        self.launchctl = launchctl
+
+        code, _ = self.run_cli("--enroll", str(third))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(lock_was_free, [True])
 
     def test_status_tells_an_agent_that_is_loaded_from_one_that_only_has_a_file(self):
         self.enrol_both()

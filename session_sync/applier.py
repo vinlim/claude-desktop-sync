@@ -18,7 +18,7 @@ from session_sync.scanner import PartitionScan, Stamp, record_path, stamp_of, tm
 class Outcome:
     action: Action
     problem: Optional[str]  # None: done
-    kept: Optional[Path] = None  # where the replaced or retired file went
+    kept: Tuple[Path, ...] = ()  # where each replaced or retired file went
 
 
 class Refused(Exception):
@@ -60,7 +60,7 @@ class Applier:
 
     def _attempt(self, action: Action) -> Outcome:
         try:
-            return Outcome(action, None, kept=self.handlers[type(action)](action))
+            return Outcome(action, None, kept=self.handlers[type(action)](action) or ())  # a create keeps nothing
         except Refused as refusal:
             return Outcome(action, str(refusal))
         except OSError as error:
@@ -77,13 +77,13 @@ class Applier:
             self._create(target, data, mtime_ns, "a file appeared at the target since the scan")
             self.on_created(action.target, action.session_id)
 
-    def _replace_record(self, action: ReplaceRecord) -> Optional[Path]:
+    def _replace_record(self, action: ReplaceRecord) -> Tuple[Path, ...]:
         data, mtime_ns = self._read_planned_record(action.source, action.session_id)
         partition = Path(action.target)
         path = record_path(partition, action.session_id)
         scanned = self.scans[action.target].records.get(action.session_id)
         self._guard_existing(partition, path, scanned)  # before anything is written: a refusal leaves no trace
-        kept = self._keep(partition, path) if action.keep else None
+        kept = (self._keep(partition, path),) if action.keep else ()
         staged = stage(path, data, mtime_ns)
         try:
             self._guard_existing(partition, path, scanned)  # after the slow write, right before the rename
@@ -93,7 +93,7 @@ class Applier:
         commit_replace(staged, path)
         return kept
 
-    def _retire_record(self, action: RetireRecord) -> Optional[Path]:
+    def _retire_record(self, action: RetireRecord) -> Tuple[Path, ...]:
         partition = Path(action.target)
         scan = self.scans[action.target]
         sibling = tmp_path(partition, action.session_id)
@@ -101,15 +101,14 @@ class Applier:
         if scanned_sibling is None and os.path.lexists(sibling):
             raise Refused("a temp file appeared since the scan")
         # The temp file goes first: left behind alone, the app would promote it to a live record.
-        if scanned_sibling is not None:
-            self._retire(partition, sibling, scanned_sibling)
-        return self._retire(partition, record_path(partition, action.session_id),
-                            scan.records.get(action.session_id), absent_sibling=sibling)
+        kept = (self._retire(partition, sibling, scanned_sibling),) if scanned_sibling is not None else ()
+        return kept + (self._retire(partition, record_path(partition, action.session_id),
+                                    scan.records.get(action.session_id), absent_sibling=sibling),)
 
-    def _retire_tmp(self, action: RetireTmp) -> Optional[Path]:
+    def _retire_tmp(self, action: RetireTmp) -> Tuple[Path, ...]:
         partition = Path(action.target)
-        return self._retire(partition, tmp_path(partition, action.session_id),
-                            self.scans[action.target].tmps.get(action.session_id))
+        return (self._retire(partition, tmp_path(partition, action.session_id),
+                             self.scans[action.target].tmps.get(action.session_id)),)
 
     # -- tombstones ------------------------------------------------------------
 
@@ -126,10 +125,10 @@ class Applier:
         except FileExistsError:
             pass
 
-    def _retire_tombstone(self, action: RetireTombstone) -> Optional[Path]:
+    def _retire_tombstone(self, action: RetireTombstone) -> Tuple[Path, ...]:
         partition = Path(action.target)
-        return self._retire(partition, tombstone_path(partition, action.session_id),
-                            self.scans[action.target].tombstones.get(action.session_id))
+        return (self._retire(partition, tombstone_path(partition, action.session_id),
+                             self.scans[action.target].tombstones.get(action.session_id)),)
 
     # -- shared steps ----------------------------------------------------------
 

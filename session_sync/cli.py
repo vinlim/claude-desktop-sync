@@ -44,7 +44,7 @@ class Environment:
     agent_plist: Path = agent.PLIST
     launchctl: Callable = subprocess.run
     quiet_out: Optional[TextIO] = None  # None: quiet runs append to the log file
-    lock_wait_s: float = 30.0  # how long a command that changes the sync history waits for a run to finish
+    lock_wait_s: float = 30.0  # how long a command that changes the sync history or the enrolment waits for a run
 
 
 def install_sigterm_handler() -> None:
@@ -134,7 +134,8 @@ def _run(args, env: Environment, say) -> int:
 @contextlib.contextmanager
 def _run_lock(env: Environment, wait_s: float):
     """One run at a time. A run saves its state at the end, so anything that edits the
-    sync history has to hold the same lock or the run would overwrite the edit."""
+    sync history has to hold the same lock or the run would overwrite the edit. A run also
+    reads the enrolment under it, so a change to the enrolment holds it too."""
     env.settings.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     with open(env.settings.lock_path, "a") as lock:
         deadline = time.monotonic() + wait_s
@@ -196,10 +197,13 @@ def _clear_abort_marker(env: Environment) -> None:
 
 
 def _change_enrolment(args, env: Environment, say) -> int:
-    for path in args.enroll or []:
-        enrol(env.settings.config_path, Path(path))
-    for path in args.unenroll or []:
-        unenrol(env.settings.config_path, Path(path))
+    # A run reads the enrolment under this lock, so none still works from the old set once this returns.
+    with _run_lock(env, env.lock_wait_s):
+        for path in args.enroll or []:
+            enrol(env.settings.config_path, Path(path))
+        for path in args.unenroll or []:
+            unenrol(env.settings.config_path, Path(path))
+    # The agent runs at load, and a lock still held then would turn its first run away.
     enrolled = load_enrolled(env.settings.config_path)
     if agent.is_installed(env.agent_plist):
         if len(enrolled) >= 2:

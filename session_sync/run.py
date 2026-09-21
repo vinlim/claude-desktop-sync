@@ -262,14 +262,14 @@ def _folders_under(root: Path) -> List[Path]:
 
 def _prune_kept(kept_root: Path, now: int, never: Path) -> None:
     """Kept copies are bounded by age and by total size, oldest run first. The run that just
-    finished is never touched: its report names those paths."""
+    finished counts toward the size and is never removed: its report names those paths."""
     try:
         runs = sorted((os.lstat(run).st_mtime_ns, run) for run in kept_root.iterdir()
                       if run.is_dir() and not run.is_symlink() and run != never)
     except OSError:
         return
     sizes = {run: _size_of(run) for _, run in runs}
-    total = sum(sizes.values())
+    total = sum(sizes.values()) + _size_of(never)
     for written_ns, run in runs:
         if now - written_ns > KEPT_MAX_AGE_S * 1_000_000_000 or total > KEPT_MAX_BYTES:
             shutil.rmtree(run, ignore_errors=True)

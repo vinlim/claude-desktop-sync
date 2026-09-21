@@ -66,8 +66,8 @@ def _count_lines(report: RunReport) -> List[str]:
 
 def _kept_lines(report: RunReport) -> List[str]:
     """R8: whatever was replaced or retired with something unique in it, and where it went."""
-    return ["kept the previous copy of %s from %s: %s" % (o.action.session_id, label(Path(o.action.target)), o.kept)
-            for o in report.done if o.kept is not None]
+    return ["kept the previous copy of %s from %s: %s" % (o.action.session_id, label(Path(o.action.target)), path)
+            for o in report.done for path in o.kept]
 
 
 def _standing_lines(report: RunReport) -> List[str]:

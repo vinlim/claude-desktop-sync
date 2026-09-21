@@ -701,9 +701,28 @@ class SafetyNets(RunTest):
         with mock.patch.object(module, "KEPT_MAX_BYTES", 1):
             report = self.sync()
 
-        kept = [outcome.kept for outcome in report.done if outcome.kept]
+        kept = [path for outcome in report.done for path in outcome.kept]
         self.assertEqual(len(kept), 1)
         self.assertTrue(kept[0].exists(), "the report names this path, so it must still be there")
+
+    def test_what_this_run_kept_counts_toward_the_size_cap(self):
+        import session_sync.run as module
+        older = self.settings.kept_root / "20260101-000000"
+        older.mkdir(parents=True)
+        (older / "local_big.json").write_bytes(b"x" * 1000)
+        os.utime(older, ns=((self.clock_s - 86400) * SECOND_NS,) * 2)
+        write_record(self.box.a, X, activity=100, title="agreed")
+        self.sync()
+        write_record(self.box.a, X, at_s=LONG_AGO_S + 50, activity=500, title="work under A")
+        write_record(self.box.b, X, at_s=LONG_AGO_S + 60, activity=900, title="later work under B")
+
+        with mock.patch.object(module, "KEPT_MAX_BYTES", 1000):
+            report = self.sync()
+
+        kept = [path for outcome in report.done for path in outcome.kept]
+        self.assertEqual(len(kept), 1)
+        self.assertTrue(kept[0].exists())
+        self.assertFalse(older.exists(), "the older run fits the cap alone, and no longer with this run's copy")
 
     def test_a_run_stopped_in_the_middle_leaves_nothing_half_done_and_the_next_run_finishes(self):
         import session_sync.applier as module

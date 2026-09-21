@@ -117,7 +117,7 @@ claude-desktop-session-sync --install-agent
 | `--verbose` | Lists every action |
 | `--status` | Enrolled directories, the agent, the last clean run, standing problems |
 | `--list` | Enrolled directories and candidates |
-| `--enroll PATH`, `--unenroll PATH` | Adds or removes a directory |
+| `--enroll PATH`, `--unenroll PATH` | Adds or removes a directory. Waits for a run in flight to finish first |
 | `--prefer PARTITION` | Settles tied conflicts in favour of one directory. Add `--session ID` to settle one session |
 | `--recreate ID` | Lets the next run put back a session reported as gone without a delete marker |
 | `--install-agent`, `--uninstall-agent` | Adds or removes the launchd agent |

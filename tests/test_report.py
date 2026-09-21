@@ -74,13 +74,25 @@ class KeptCopies(unittest.TestCase):
     def test_a_resolved_conflict_names_where_the_losing_copy_went(self):
         from session_sync.model import ReplaceRecord
         kept = Path("/state/kept/20260921-120000/b_b/local_%s.json" % X)
-        resolved = Outcome(ReplaceRecord(X, str(A), str(B), keep=True), None, kept=kept)
+        resolved = Outcome(ReplaceRecord(X, str(A), str(B), keep=True), None, kept=(kept,))
 
         normal, _ = render(report(applied=True, outcomes=[resolved]))
         quiet, _ = render(report(applied=True, outcomes=[resolved]), quiet=True)
 
         for text in (normal, quiet):
             self.assertIn("kept the previous copy of %s from bbbbbbbb/bbbbbbbb: %s" % (X, kept), text)
+
+    def test_a_record_retired_with_its_temp_file_names_where_both_went(self):
+        from session_sync.model import RetireRecord
+        folder = Path("/state/kept/20260921-120000/b_b")
+        kept = (folder / ("local_%s.json.tmp" % X), folder / ("local_%s.json" % X))
+        retired = Outcome(RetireRecord(X, str(B)), None, kept=kept)
+
+        text, _ = render(report(applied=True, outcomes=[retired]))
+
+        # Whole lines: one path is a prefix of the other.
+        for path in kept:
+            self.assertIn("kept the previous copy of %s from bbbbbbbb/bbbbbbbb: %s" % (X, path), text.splitlines())
 
 
 class QuietOutput(unittest.TestCase):

@@ -268,8 +268,8 @@ class KeptCopies(ApplierTest):
         replaced, created = self.apply(ReplaceRecord(X, source=self.A, target=self.B, keep=True),
                                        CreateRecord(Y, source=self.A, target=self.B))
 
-        self.assertIn('"loser"', replaced.kept.read_text())
-        self.assertIsNone(created.kept)
+        self.assertEqual(['"loser"' in path.read_text() for path in replaced.kept], [True])
+        self.assertEqual(created.kept, ())
 
     def test_two_kept_versions_of_one_file_never_overwrite_each_other(self):
         write_record(self.box.a, X, title="winner")
@@ -296,6 +296,15 @@ class RetiringARecord(ApplierTest):
         prefix = "%s_%s/" % (self.box.a.parent.name, self.box.a.name)
         self.assertEqual(self.kept_files(), [prefix + "local_%s.json" % X, prefix + "local_%s.json.tmp" % X])
         self.assertEqual((self.kept / prefix / ("local_%s.json" % X)).read_bytes(), record)
+
+    def test_the_outcome_says_where_the_record_and_its_temp_sibling_went(self):
+        write_record(self.box.a, X)
+        (self.box.a / ("local_%s.json.tmp" % X)).write_text("half a save")
+
+        retired, = self.apply(RetireRecord(X, target=self.A))
+
+        self.assertEqual(sorted(path.name for path in retired.kept), ["local_%s.json" % X, "local_%s.json.tmp" % X])
+        self.assertEqual([path.read_text() for path in retired.kept if path.name.endswith(".tmp")], ["half a save"])
 
     def test_a_temp_file_that_appears_while_the_record_is_being_kept_stops_the_retirement(self):
         # An app save cut short leaves local_X.json.tmp. Left alone beside a retired record,

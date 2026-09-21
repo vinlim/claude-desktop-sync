@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 from session_sync.atomic import write_atomic
+from session_sync.fingerprint import normalisation
 from session_sync.model import SyncState
 from session_sync.scanner import CacheEntry
 
@@ -48,6 +49,7 @@ def encode_state(stored: StoredState) -> dict:
     sync = stored.sync
     return {
         "version": VERSION,
+        "normalisation": normalisation(),
         "agreed": dict(sync.agreed),
         "seen": {key: sorted(ids) for key, ids in sync.seen.items()},
         "placed": {key: dict(entries) for key, entries in sync.placed.items()},
@@ -70,6 +72,10 @@ def _decode(raw: dict) -> StoredState:
                 for key, entries in raw["placed"].items()})
     cache = {key: {sid: (int(e[0]), int(e[1]), e[2], int(e[3])) for sid, e in entries.items()}
              for key, entries in raw["cache"].items()}
+    if raw.get("normalisation") != normalisation():
+        # Read in full first, so a damaged file is still refused. Hashes made another way cannot be
+        # compared: agreement re-forms from content on the next run. What was seen where is no hash.
+        sync.agreed, sync.placed, cache = {}, {}, {}
     logins = {str(root): (str(seen[0]), int(seen[1])) for root, seen in raw["logins"].items()}
     return StoredState(sync=sync, cache=cache, logins=logins, reported=str(raw["reported"]),
                        last_success_ms=int(raw["last_success_ms"]))

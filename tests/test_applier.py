@@ -336,6 +336,19 @@ class RetiringARecord(ApplierTest):
         self.assertIn("target changed", applier.apply(Plan(actions=[RetireRecord(X, target=self.A)]))[0].problem)
         self.assertEqual(self.names(self.box.a), ["local_%s.json" % X])
 
+    def test_a_refused_retirement_leaves_the_temp_sibling_where_it_was(self):
+        # The record is checked before the temp file is touched, so a refusal leaves no trace.
+        write_record(self.box.a, X)
+        (self.box.a / ("local_%s.json.tmp" % X)).write_text("half a save")
+        applier = self.prepare()
+        write_record(self.box.a, X, at_s=LONG_AGO_S + 9, title="app saved meanwhile")
+
+        outcomes = applier.apply(Plan(actions=[RetireRecord(X, target=self.A)]))
+
+        self.assertIn("target changed", outcomes[0].problem)
+        self.assertEqual(self.names(self.box.a), ["local_%s.json" % X, "local_%s.json.tmp" % X])
+        self.assertEqual(self.kept_files(), [])
+
     def test_an_orphaned_temp_file_is_moved_aside(self):
         (self.box.a / ("local_%s.json.tmp" % X)).write_text("orphan")
 

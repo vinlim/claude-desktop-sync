@@ -118,6 +118,20 @@ class UnreadableCopies(unittest.TestCase):
         self.assertEqual(result.problems, [Problem("unreadable", X, "A")])
 
 
+class FutureDatedCopies(unittest.TestCase):
+    """R11: a copy whose activity is dated in the future decides nothing."""
+
+    def test_it_freezes_the_session_and_says_why(self):
+        from session_sync.model import Copy
+        ahead = Copy(state_hash="v2", last_activity_at=10 ** 15, future_dated=True)
+
+        result = planned([snapshot("A", {X: ahead}), snapshot("B", {X: copy("v1")}), snapshot("C")],
+                         state(agreed={X: "v1"}))
+
+        self.assertEqual(result.actions, [])
+        self.assertEqual(result.problems, [Problem("future", X, "A")])
+
+
 class LostRecords(unittest.TestCase):
     """R7."""
 

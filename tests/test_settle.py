@@ -25,6 +25,14 @@ class Agreement(unittest.TestCase):
 
         self.assertEqual(after.agreed, {})
 
+    def test_identical_copies_agree_even_when_their_time_cannot_be_trusted(self):
+        from session_sync.model import Copy
+        ahead = Copy(state_hash="v2", last_activity_at=10 ** 15, future_dated=True)
+
+        after = settle(state(), [snapshot("A", {X: ahead}), snapshot("B", {X: ahead})])
+
+        self.assertEqual(after.agreed, {X: "v2"})
+
     def test_the_given_state_is_not_modified(self):
         before = state(agreed={X: "v1"})
 
@@ -47,6 +55,18 @@ class FinishedDeletes(unittest.TestCase):
 
         self.assertEqual(after.agreed, {X: "v1"})
         self.assertEqual(after.seen, {"A": {X}, "B": {X}})
+
+
+class PresenceFromTheRunItself(unittest.TestCase):
+    def test_what_the_run_saw_or_placed_counts_even_if_the_final_scan_no_longer_shows_it(self):
+        after = settle(state(), [snapshot("A", {X: copy("v1")}), snapshot("B")], also_present={"B": {X}})
+
+        self.assertEqual(after.seen, {"A": {X}, "B": {X}})
+
+    def test_it_is_still_forgotten_once_no_partition_holds_the_record(self):
+        after = settle(state(), [snapshot("A"), snapshot("B")], also_present={"A": {X}, "B": {X}})
+
+        self.assertEqual(after.seen, {"A": set(), "B": set()})
 
 
 class RememberedPlacements(unittest.TestCase):

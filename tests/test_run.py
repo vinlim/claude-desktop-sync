@@ -240,6 +240,120 @@ class HardSequences(RunTest):
         self.assertEqual(len(self.kept()), 1)
 
 
+class PresenceSeenDuringARun(RunTest):
+    """R7: what a run observed or created counts as present, even if it is gone by the final scan."""
+
+    def app_acts_right_after_the_writes(self, act):
+        from session_sync.applier import Applier
+        real = Applier.apply
+
+        def apply_then_app_acts(applier, plan):
+            outcomes = real(applier, plan)
+            act()
+            return outcomes
+
+        return mock.patch.object(Applier, "apply", apply_then_app_acts)
+
+    def test_a_source_removed_before_the_final_scan_is_not_put_back(self):
+        # The app deletes X under B just after the tool copied it to A: the record goes first,
+        # the tombstone later, or never if writing it fails.
+        write_record(self.box.a, Y)
+        self.sync()
+        write_record(self.box.b, X)
+        with self.app_acts_right_after_the_writes((self.box.b / ("local_%s.json" % X)).unlink):
+            self.sync()
+
+        for _ in range(3):
+            report = self.sync()
+            self.assertNotIn("local_%s.json" % X, self.names(self.box.b))
+            self.assertIn(("lost", X, str(self.box.b)), {(p.kind, p.session_id, p.partition) for p in report.problems})
+
+    def test_a_record_the_tool_created_and_that_is_gone_again_is_not_created_twice(self):
+        write_record(self.box.a, Y)
+        self.sync()
+        write_record(self.box.b, X)
+        with self.app_acts_right_after_the_writes(lambda: (self.box.a / ("local_%s.json" % X)).unlink()):
+            self.sync()
+
+        for _ in range(3):
+            self.sync()
+            self.assertNotIn("local_%s.json" % X, self.names(self.box.a))
+
+    def test_what_a_run_saw_is_remembered_even_if_the_run_never_finishes(self):
+        write_record(self.box.a, Y)
+        self.sync()
+        write_record(self.box.b, X)
+        with mock.patch("session_sync.run.Applier.apply", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.sync()
+        (self.box.b / ("local_%s.json" % X)).unlink()
+        write_record(self.box.a, X)  # as if the stopped run had got as far as copying it
+
+        self.sync()
+
+        self.assertNotIn("local_%s.json" % X, self.names(self.box.b))
+
+
+class UntrustworthyTimes(RunTest):
+    def test_activity_dated_in_the_future_decides_nothing(self):
+        # A record saved while the clock ran ahead. Read as "now" it would outrank every
+        # tombstone and undo a real delete.
+        day_ms = 86_400_000
+        write_record(self.box.a, X, activity=self.clock_s * 1000 + day_ms)
+        write_tombstone(self.box.b, X, deleted_at_ms=self.clock_s * 1000 - 1000)
+
+        report = self.sync()
+
+        self.assertEqual(self.names(self.box.a), ["local_%s.json" % X])
+        self.assertEqual(self.names(self.box.b), ["deleted_%s" % X])
+        self.assertEqual([(p.kind, p.partition) for p in report.problems], [("future", str(self.box.a))])
+
+
+    def test_a_session_in_use_is_never_reported_as_future_dated(self):
+        ticks = iter(range(10_000))
+        start_ms = self.clock_s * 1000
+        write_record(self.box.a, X, activity=start_ms + 1_500)  # saved just after the run began
+
+        report = sync(self.settings, apply=True, running=lambda: False,
+                      now_ns=lambda: (start_ms + 1_000 * next(ticks)) * 1_000_000)
+
+        self.assertEqual(report.problems, [])
+        self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
+
+
+class UnreadableFiles(RunTest):
+    def test_a_copy_that_cannot_be_read_freezes_its_session_instead_of_reading_as_absent(self):
+        # A is where the delete happened. B holds the newer copy but cannot be read.
+        # Reading B as absent would retire C's copy and put a tombstone beside B's record.
+        third = self.box.partition("cccccccc-0000-4000-8000-000000000003", "cccccccc-0000-4000-8000-0000000000c3")
+        enrol(self.settings.config_path, third)
+        write_tombstone(self.box.a, X, deleted_at_ms=500)
+        locked = write_record(self.box.b, X, activity=900)
+        write_record(third, X, activity=100)
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o600)
+
+        report = self.sync()
+
+        self.assertEqual(self.names(third), ["local_%s.json" % X])
+        self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
+        self.assertEqual([(p.kind, p.partition) for p in report.problems], [("unreadable", str(self.box.b))])
+
+        os.chmod(locked, 0o600)  # repaired without touching the file's time or size
+        self.sync()
+        self.assertEqual(self.names(self.box.a), ["local_%s.json" % X], "B's later activity now counts")
+
+    def test_a_partition_that_cannot_be_listed_stops_the_run_cleanly(self):
+        write_record(self.box.a, X)
+        os.chmod(self.box.b, 0o000)
+        self.addCleanup(os.chmod, self.box.b, 0o700)
+
+        with self.assertRaises(RunAborted) as raised:
+            self.sync()
+
+        self.assertIn(str(self.box.b), str(raised.exception))
+
+
 class ThreePartitions(RunTest):
     def test_a_second_change_after_partial_propagation_still_gets_through(self):
         third = self.box.partition("cccccccc-0000-4000-8000-000000000003", "cccccccc-0000-4000-8000-0000000000c3")

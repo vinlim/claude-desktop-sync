@@ -98,7 +98,7 @@ class Applier:
         if scanned_sibling is not None:
             self._retire(partition, sibling, scanned_sibling)
         return self._retire(partition, record_path(partition, action.session_id),
-                            scan.records.get(action.session_id))
+                            scan.records.get(action.session_id), absent_sibling=sibling)
 
     def _retire_tmp(self, action: RetireTmp) -> Optional[Path]:
         partition = Path(action.target)
@@ -170,10 +170,15 @@ class Applier:
         write_atomic(kept, path.read_bytes(), stamp[0])
         return kept
 
-    def _retire(self, partition: Path, path: Path, scanned: Optional[Stamp]) -> Path:
+    def _retire(self, partition: Path, path: Path, scanned: Optional[Stamp],
+                absent_sibling: Optional[Path] = None) -> Path:
         self._guard_existing(partition, path, scanned)
         kept = self._keep(partition, path)
         self._guard_existing(partition, path, scanned)
+        # Keeping takes a write and a sync. An app save cut short in that time leaves a temp file,
+        # which the app would promote at its next start if the record were gone.
+        if absent_sibling is not None and os.path.lexists(absent_sibling):
+            raise Refused("a temp file appeared during the retirement")
         os.unlink(path)
         return kept
 

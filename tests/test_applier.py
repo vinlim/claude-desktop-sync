@@ -26,7 +26,7 @@ class ApplierTest(unittest.TestCase):
         return self.applier.apply(Plan(actions=list(actions)))
 
     def prepare(self):
-        scans = {str(p): scan_partition(p, {}, now_ns=NOW_NS) for p in (self.box.a, self.box.b)}
+        scans = {str(p): scan_partition(p, {}, clock=lambda: NOW_NS) for p in (self.box.a, self.box.b)}
         return Applier(scans, is_live=lambda partition: str(partition) in self.live, kept_dir=self.kept)
 
     def problems(self, outcomes):
@@ -78,8 +78,8 @@ class CreatingARecord(ApplierTest):
         path = write_record(self.box.a, X, title="what is really on disk")
         info = os.lstat(path)
         poisoned = {X: (info.st_mtime_ns, info.st_size, "hash-of-some-other-version", 100)}
-        scans = {self.A: scan_partition(self.box.a, poisoned, now_ns=NOW_NS),
-                 self.B: scan_partition(self.box.b, {}, now_ns=NOW_NS)}
+        scans = {self.A: scan_partition(self.box.a, poisoned, clock=lambda: NOW_NS),
+                 self.B: scan_partition(self.box.b, {}, clock=lambda: NOW_NS)}
         applier = Applier(scans, is_live=lambda partition: False, kept_dir=self.kept)
 
         outcomes = applier.apply(Plan(actions=[CreateRecord(X, source=self.A, target=self.B)]))
@@ -178,7 +178,7 @@ class GuardTiming(ApplierTest):
         # The guard runs pgrep, so a SIGTERM from launchd can land right there.
         write_record(self.box.a, X, title="new")
         write_record(self.box.b, X, title="old")
-        scans = {str(p): scan_partition(p, {}, now_ns=NOW_NS) for p in (self.box.a, self.box.b)}
+        scans = {str(p): scan_partition(p, {}, clock=lambda: NOW_NS) for p in (self.box.a, self.box.b)}
         calls = []
 
         def stopped_on_the_second_probe(partition):
@@ -248,6 +248,25 @@ class RetiringARecord(ApplierTest):
         prefix = "%s_%s/" % (self.box.a.parent.name, self.box.a.name)
         self.assertEqual(self.kept_files(), [prefix + "local_%s.json" % X, prefix + "local_%s.json.tmp" % X])
         self.assertEqual((self.kept / prefix / ("local_%s.json" % X)).read_bytes(), record)
+
+    def test_a_temp_file_that_appears_while_the_record_is_being_kept_stops_the_retirement(self):
+        # An app save cut short leaves local_X.json.tmp. Left alone beside a retired record,
+        # the app would promote it at its next start, tombstone or not.
+        write_record(self.box.a, X)
+        applier = self.prepare()
+        real_keep = applier._keep
+
+        def keep_while_the_app_starts_a_save(partition, path):
+            kept = real_keep(partition, path)
+            (self.box.a / ("local_%s.json.tmp" % X)).write_text("a save cut short")
+            return kept
+
+        applier._keep = keep_while_the_app_starts_a_save
+
+        outcomes = applier.apply(Plan(actions=[RetireRecord(X, target=self.A)]))
+
+        self.assertIn("temp file appeared", outcomes[0].problem)
+        self.assertEqual(self.names(self.box.a), ["local_%s.json" % X, "local_%s.json.tmp" % X])
 
     def test_live_or_changed_records_stay(self):
         write_record(self.box.a, X)

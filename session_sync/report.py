@@ -13,7 +13,10 @@ EXPLANATIONS = {
             "changed in the last two minutes). A later run syncs it",
     "tied": "both copies changed with no new activity on either. Choose one with --prefer PARTITION",
     "lost": "was here before and is gone without a delete marker, so it is not recreated here",
-    "unreadable": "this copy is not a valid session record, so nothing is done for this session",
+    "unreadable": "this copy cannot be read or is not a valid session record, so nothing is done for this session",
+    "future": "this copy's last activity is dated in the future, so it cannot be ordered against a delete or "
+              "another copy. Nothing is done for this session until the clock catches up. Using the session, or "
+              "deleting it under this login as well, settles it sooner",
 }
 
 

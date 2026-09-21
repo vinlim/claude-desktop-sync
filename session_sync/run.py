@@ -100,7 +100,7 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
         _sweep_stale_temps(partitions + [settings.state_dir], now_ns())
         _sweep_stale_temps(_folders_under(settings.kept_root), now_ns())
 
-    scans = _scan(partitions, stored.cache, now_ns())
+    scans = _scan_or_abort(partitions, stored.cache, now_ns, "Nothing was changed.")
     app_is_running = running()
     observe_logins(partitions, stored.logins, now_ns() // 1_000_000)
     live = {str(p) for p in partitions if is_live(p, app_is_running, now_ns() // 1_000_000, stored.logins)}
@@ -115,20 +115,44 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
     if not apply:
         return report
 
+    if _remember_what_was_seen(stored, scans):
+        # Durable before the first write: a run that dies must not forget what it saw (R7).
+        save_state(settings.state_path, stored)
+        on_disk = encode_state(stored)
     kept_dir = settings.kept_root / time.strftime("%Y%m%d-%H%M%S", time.localtime(now_ns() // 1_000_000_000))
     applier = Applier(scans, kept_dir=kept_dir, before_create=intents.record, is_live=lambda partition: is_live(
         partition, running(), now_ns() // 1_000_000, stored.logins))
     report.outcomes = applier.apply(the_plan)
     _remember_placements(stored, report.done, scans)
 
-    fresh = _scan(partitions, {key: scan.cache for key, scan in scans.items()}, now_ns())
-    stored.sync = settle(stored.sync, [scan.snapshot for scan in fresh.values()])
+    fresh = _scan_or_abort(partitions, {key: scan.cache for key, scan in scans.items()}, now_ns,
+                           "This run's writes stand, but what it learned was not saved. The next run checks again.")
+    stored.sync = settle(stored.sync, [scan.snapshot for scan in fresh.values()],
+                         also_present=_created(report.done))
     stored.cache = {key: scan.cache for key, scan in fresh.items()}
     if not report.failures:
         _prune_kept(settings.kept_root, now_ns(), never=kept_dir)
     _save_if_worth_it(settings, stored, on_disk, clean=not report.failures, now_ms=now_ns() // 1_000_000)
     intents.clear()
     return report
+
+
+def _remember_what_was_seen(stored: StoredState, scans: Dict[str, PartitionScan]) -> bool:
+    """Returns whether anything new was seen."""
+    grew = False
+    for key, scan in scans.items():
+        known = stored.sync.seen.setdefault(key, set())
+        grew = grew or not known.issuperset(scan.snapshot.records)
+        known.update(scan.snapshot.records)
+    return grew
+
+
+def _created(done: List[Outcome]) -> Dict[str, set]:
+    created: Dict[str, set] = {}
+    for outcome in done:
+        if isinstance(outcome.action, CreateRecord):
+            created.setdefault(outcome.action.target, set()).add(outcome.action.session_id)
+    return created
 
 
 def _remember_placements(stored: StoredState, done: List[Outcome], scans: Dict[str, PartitionScan]) -> None:
@@ -195,8 +219,17 @@ def _state_or_abort(settings: Settings) -> StoredState:
         raise RunAborted(str(error))
 
 
-def _scan(partitions: List[Path], cache: Dict[str, dict], now: int) -> Dict[str, PartitionScan]:
-    return {str(p): scan_partition(p, cache.get(str(p), {}), now_ns=now) for p in partitions}
+def _scan_or_abort(partitions: List[Path], cache: Dict[str, dict], clock: Callable[[], int],
+                   consequence: str) -> Dict[str, PartitionScan]:
+    """A partition that cannot be listed says nothing about what it holds, so nothing is decided."""
+    scans = {}
+    for partition in partitions:
+        try:
+            scans[str(partition)] = scan_partition(partition, cache.get(str(partition), {}), clock=clock)
+        except OSError as error:
+            raise RunAborted("%s cannot be read (%s: %s). %s"
+                             % (partition, type(error).__name__, error, consequence))
+    return scans
 
 
 def _resolve_prefer(prefer: Optional[str], partitions: List[Path]) -> Optional[str]:

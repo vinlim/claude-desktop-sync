@@ -13,7 +13,7 @@ NOW_MS = NOW_S * 1000
 
 
 def scan(path, cache=None):
-    return scan_partition(path, cache or {}, now_ns=NOW_NS)
+    return scan_partition(path, cache or {}, clock=lambda: NOW_NS)
 
 
 class WhatCounts(unittest.TestCase):
@@ -145,22 +145,49 @@ class OddRecords(unittest.TestCase):
         self.assertFalse(result.snapshot.records[X].readable)
         self.assertTrue(result.snapshot.records[Y].readable)
 
-    def test_activity_dated_in_the_future_is_read_as_now(self):
-        # Otherwise such a record would outrank every tombstone and could never be deleted.
-        write_record(self.box.a, X, activity=NOW_MS + 10 ** 9)
-        first = scan(self.box.a)
-
-        self.assertEqual(first.snapshot.records[X].last_activity_at, NOW_MS)
-        self.assertEqual(scan(self.box.a, cache=first.cache).snapshot.records[X].last_activity_at, NOW_MS)
-
-    def test_the_cache_keeps_the_time_as_written_so_the_clamp_follows_the_clock(self):
+    def test_activity_dated_in_the_future_makes_the_copy_unusable_until_the_clock_catches_up(self):
+        # Read as "now" it would outrank every tombstone and undo a real delete.
         write_record(self.box.a, X, activity=NOW_MS + 5_000)
         first = scan(self.box.a)
+        again = scan(self.box.a, cache=first.cache)
+        later = scan_partition(self.box.a, first.cache, clock=lambda: NOW_NS + 60 * SECOND_NS)
 
-        later = scan_partition(self.box.a, first.cache, now_ns=NOW_NS + 60 * SECOND_NS)
-
-        self.assertEqual(first.cache[X][3], NOW_MS + 5_000)
+        for early in (first, again):
+            self.assertTrue(early.snapshot.records[X].future_dated)
+            self.assertFalse(early.snapshot.records[X].usable)
+        self.assertEqual(first.cache[X][3], NOW_MS + 5_000, "the cache keeps the time as written")
+        self.assertTrue(later.snapshot.records[X].usable)
         self.assertEqual(later.snapshot.records[X].last_activity_at, NOW_MS + 5_000)
+
+    def test_a_record_the_app_saved_while_the_scan_was_running_is_not_future_dated(self):
+        # A session in use is saved every few seconds with the current time. Judged against the
+        # moment the scan began, a save that lands during the scan would look like the future.
+        readings = []
+
+        def clock():
+            readings.append(1)
+            return NOW_NS if len(readings) == 1 else NOW_NS + 2 * SECOND_NS
+
+        write_record(self.box.a, X, activity=NOW_MS + 1_000)
+        write_tombstone(self.box.a, Y, deleted_at_ms=NOW_MS + 1_000)
+
+        result = scan_partition(self.box.a, {}, clock=clock)
+
+        self.assertTrue(result.snapshot.records[X].usable)
+        self.assertEqual(result.snapshot.tombstones[Y], NOW_MS + 1_000, "its own time, not the file's")
+
+    def test_a_record_that_exists_but_cannot_be_read_is_unreadable_not_absent(self):
+        path = write_record(self.box.a, X)
+        os.chmod(path, 0o000)
+        self.addCleanup(os.chmod, path, 0o600)
+
+        locked = scan(self.box.a)
+        os.chmod(path, 0o600)
+        repaired = scan(self.box.a, cache=locked.cache)
+
+        self.assertFalse(locked.snapshot.records[X].readable)
+        self.assertIn(X, locked.records, "the applier still needs its stamp")
+        self.assertTrue(repaired.snapshot.records[X].readable, "a repair changes neither time nor size")
 
 
 class Cache(unittest.TestCase):

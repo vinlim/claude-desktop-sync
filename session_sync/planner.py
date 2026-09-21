@@ -25,9 +25,11 @@ def plan(snapshots: List[Snapshot], state: SyncState, live: Set[str], prefer: Op
 def _plan_session(session_id: str, snapshots: List[Snapshot], state: SyncState, live: Set[str],
                   prefer: Optional[str], result: Plan) -> None:
     holders = [s for s in snapshots if session_id in s.records]
-    unreadable = [s for s in holders if not s.records[session_id].readable]
-    if unreadable:  # R11: without a readable copy nothing about this id can be judged
-        result.problems.extend(Problem("unreadable", session_id, s.key) for s in unreadable)
+    unusable = [s for s in holders if not s.records[session_id].usable]
+    if unusable:  # R11: one copy that cannot be read or ordered, and nothing about this id can be judged
+        result.problems.extend(
+            Problem("unreadable" if not s.records[session_id].readable else "future", session_id, s.key)
+            for s in unusable)
         return
 
     entombed = [s for s in snapshots if session_id in s.tombstones]

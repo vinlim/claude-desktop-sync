@@ -7,12 +7,18 @@ from typing import Dict, FrozenSet, List, Mapping, Optional, Set, Union
 class Copy:
     """One partition's copy of a record, reduced to what a decision needs."""
 
-    state_hash: Optional[str]  # None: the file is not a record the app would accept
+    state_hash: Optional[str]  # None: the file could not be read, or is not a record the app would accept
     last_activity_at: int = 0
+    future_dated: bool = False  # the activity is later than now, so it cannot be ordered against anything
 
     @property
     def readable(self) -> bool:
         return self.state_hash is not None
+
+    @property
+    def usable(self) -> bool:
+        """Whether this copy may take part in a decision (R11)."""
+        return self.readable and not self.future_dated
 
 
 @dataclass(frozen=True)
@@ -80,7 +86,7 @@ Action = Union[CreateRecord, ReplaceRecord, RetireRecord, RetireTmp, CreateTombs
 
 @dataclass(frozen=True)
 class Problem:
-    """Something left alone on purpose. kind: live, tied, lost or unreadable."""
+    """Something left alone on purpose. kind: live, tied, lost, unreadable or future."""
 
     kind: str
     session_id: str

@@ -4,7 +4,7 @@ import re
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 from session_sync.fingerprint import UNREADABLE, fingerprint
 from session_sync.model import Copy, Snapshot
@@ -56,7 +56,11 @@ def stamp_of(path: Path) -> Optional[Stamp]:
     return (info.st_mtime_ns, info.st_size)
 
 
-def scan_partition(path: Path, cache: Dict[str, CacheEntry], now_ns: int) -> PartitionScan:
+def scan_partition(path: Path, cache: Dict[str, CacheEntry], clock: Callable[[], int]) -> PartitionScan:
+    """clock returns nanoseconds. It is read again after each file is read: the app stamps a
+    session in use with the current time every few seconds, and judged against the moment the
+    scan began, a save that lands during the scan would look like the future."""
+    started_ns = clock()
     copies: Dict[str, Copy] = {}
     deleted_at: Dict[str, int] = {}
     result = PartitionScan(path=path, snapshot=Snapshot(key=str(path), records=copies, tombstones=deleted_at))
@@ -68,17 +72,18 @@ def scan_partition(path: Path, cache: Dict[str, CacheEntry], now_ns: int) -> Par
             continue
         record, tmp, tombstone = RECORD_NAME.match(name), TMP_NAME.match(name), TOMBSTONE_NAME.match(name)
         if record:
-            copy = _read_record(entry, record.group(1), stamp, cache, now_ns)
+            copy = _read_record(entry, record.group(1), stamp, cache, started_ns)
             if copy is not None:
-                # Activity in the future would outrank every tombstone, and the session could never
-                # be deleted. The cache keeps the time as written, so the clamp follows the clock.
-                copies[record.group(1)] = Copy(copy.state_hash, min(copy.last_activity_at, now_ns // 1_000_000))
+                # A time in the future cannot be ordered against a delete. Read as "now" it would
+                # outrank every tombstone. The cache keeps it as written, for when the clock catches up.
+                ahead = copy.last_activity_at > clock() // 1_000_000
+                copies[record.group(1)] = Copy(copy.state_hash, copy.last_activity_at, future_dated=ahead)
                 result.records[record.group(1)] = stamp
                 result.cache[record.group(1)] = (stamp[0], stamp[1], copy.state_hash, copy.last_activity_at)
         elif tmp:
             result.tmps[tmp.group(1)] = stamp
         elif tombstone:
-            when = _read_delete_time(entry, now_ns // 1_000_000)
+            when = _read_delete_time(entry, clock)
             if when is not None:
                 deleted_at[tombstone.group(1)] = when
                 result.tombstones[tombstone.group(1)] = stamp
@@ -90,26 +95,31 @@ def scan_partition(path: Path, cache: Dict[str, CacheEntry], now_ns: int) -> Par
 
 def _read_record(path: Path, session_id: str, stamp: Stamp, cache: Dict[str, CacheEntry],
                  now_ns: int) -> Optional[Copy]:
+    """None means the file is gone. A file that is there but cannot be read is unreadable, never absent."""
     cached = cache.get(session_id)
     settled = now_ns - stamp[0] >= RACY_WINDOW_NS
-    if cached is not None and settled and (cached[0], cached[1]) == stamp:
+    # An unreadable verdict is never reused: fixing permissions changes neither time nor size.
+    if cached is not None and cached[2] is not None and settled and (cached[0], cached[1]) == stamp:
         return Copy(state_hash=cached[2], last_activity_at=cached[3])
     try:
         data = path.read_bytes()
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError:
+        return UNREADABLE
     try:
         return fingerprint(session_id, data)
     except Exception:  # one odd record must never stop the run: it is unreadable (R11)
         return UNREADABLE
 
 
-def _read_delete_time(path: Path, now_ms: int) -> Optional[int]:
+def _read_delete_time(path: Path, clock: Callable[[], int]) -> Optional[int]:
     """The tombstone's content, unless it is unusable or in the future; then the file's own time."""
     try:
         claimed = int(path.read_text().strip())
     except (OSError, ValueError):
         claimed = -1
+    now_ms = clock() // 1_000_000
     if 0 <= claimed <= now_ms:
         return claimed
     try:

@@ -191,6 +191,8 @@ The decision rules are pure functions in `session_sync/planner.py` and `session_
 
 [Vin Lim](https://astralab.co/authors/vin-lim)
 
+If it saves you time, you can support it on [Ko-fi](https://ko-fi.com/vinlim).
+
 ## License
 
 [0BSD](LICENSE). Use it for anything, with or without credit. It comes with no warranty, and the author accepts no liability for what it does, including to your data.

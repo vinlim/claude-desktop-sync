@@ -46,7 +46,8 @@ The full contract, with the facts about the app it relies on and where each was 
 - **Deletes stay deleted**, and a re-adopted session survives an old delete marker.
 - **Safe beside the running app.** It never replaces a file in a directory the app may hold, never overwrites on create, and re-checks every guard at the moment of the write.
 - **Crash safe.** Writes are staged and renamed into place, each create is written down the moment it completes, and a stopped run cleans up after itself.
-- **Bounded.** Kept copies are pruned after 30 days and above 500 MB. The log is capped.
+- **Backups built in.** One command saves the enrolled directories, the first sync takes a backup by itself, and going back to one is a dry run until you say `--apply`.
+- **Bounded.** Kept copies are pruned after 30 days and above 500 MB. The newest 10 backups are kept. The log is capped.
 - **Optional background agent** that runs whenever an enrolled directory changes.
 - **No dependencies.** Python 3.9 or later, standard library only. The Python that ships with the macOS developer tools is enough.
 
@@ -67,46 +68,54 @@ Make sure `~/.local/bin` is on your `PATH`. The command is `claude-desktop-sessi
 
 ## Use
 
-1. Back up the app's session directories.
-
-   ```bash
-   tar -czf ~/claude-code-sessions-backup.tar.gz \
-     -C "$HOME/Library/Application Support/Claude" claude-code-sessions
-   ```
-
-2. Log in to each account in the desktop app at least once and start a Code session there, so its directory exists. Then list the candidates.
+1. Log in to each account in the desktop app at least once and start a Code session there, so its directory exists. Then list the candidates.
 
    ```bash
    claude-desktop-session-sync --list
    ```
 
-3. Enrol each directory that is yours to sync. Switching accounts also leaves empty folders that pair one account with the other's org. They hold no sessions and are not listed.
+2. Enrol each directory that is yours to sync. Switching accounts also leaves empty folders that pair one account with the other's org. They hold no sessions and are not listed.
 
    ```bash
    claude-desktop-session-sync --enroll "<path from --list>" --enroll "<the other path>"
    ```
 
-4. Look at what a run would do. This writes nothing.
+3. Look at what a run would do. This writes nothing.
 
    ```bash
    claude-desktop-session-sync --verbose
    ```
 
-5. Apply it.
+4. Apply it.
 
    ```bash
    claude-desktop-session-sync --apply
    ```
 
-   The first run dates your login as just changed, so it creates missing records and defers replacing any. Run it again two minutes later.
+   The first run saves a backup of the enrolled directories before it writes anything, and prints its name. It also dates your login as just changed, so it creates missing records and defers replacing any. Run it again two minutes later.
 
-6. Make the app read the result. The app reads a login's directory only when that login initialises, so quit and reopen the app, or log out and in.
+5. Make the app read the result. The app reads a login's directory only when that login initialises, so quit and reopen the app, or log out and in.
 
 From then on, run `claude-desktop-session-sync --apply` before you switch accounts. Or install the agent, which runs whenever an enrolled directory changes:
 
 ```bash
 claude-desktop-session-sync --install-agent
 ```
+
+### Backups and going back
+
+```bash
+claude-desktop-session-sync --backup --note "before tidying"
+claude-desktop-session-sync --backups
+claude-desktop-session-sync --restore 20260922-101500            # shows what would change
+claude-desktop-session-sync --restore 20260922-101500 --apply    # quit the desktop app first
+```
+
+A backup holds every record, delete marker and temp file of the enrolled directories, plus the tool's sync history, in one zip under `~/.local/state/claude-desktop-session-sync/backups/`. Taking one only reads the app's files, so it is safe while the app runs. The newest 10 are kept.
+
+A restore rolls every enrolled directory back together, along with the sync history. One account restored alone would be overwritten from the other at the next sync. A restore refuses while the desktop app is running, because the app would write its own copy of the sessions over the restored files. It checks every file in the archive against its checksum before it writes, and it saves the present first, so a restore can itself be undone with the id it prints. It refuses when a file cannot be read, because that saved present would not hold it. If a file cannot be written or removed, the restore stops there and says which one; running the same restore again finishes it.
+
+A restore brings back sidebar entries. It cannot bring back a conversation whose transcript the app deleted along with the session. It leaves alone what this tool never syncs: scheduled tasks, the backlog, the archived-sessions index and the app's worktree registry.
 
 ### Commands
 
@@ -120,6 +129,9 @@ claude-desktop-session-sync --install-agent
 | `--enroll PATH`, `--unenroll PATH` | Adds or removes a directory. Waits for a run in flight to finish first |
 | `--prefer PARTITION` | Settles tied conflicts in favour of one directory. Add `--session ID` to settle one session |
 | `--recreate ID` | Lets the next run put back a session reported as gone without a delete marker |
+| `--backup` | Saves the enrolled directories and the sync history. Add `--note "text"` to find it by later |
+| `--backups` | Lists the backups |
+| `--restore ID` | Goes back to a backup. A dry run unless `--apply` is given. The desktop app must be quit |
 | `--install-agent`, `--uninstall-agent` | Adds or removes the launchd agent |
 | `--reset-state` | Forgets the sync history. The old file is kept |
 | `--quiet` | For unattended runs: logs writes, and each standing problem once |
@@ -146,6 +158,7 @@ Everything the tool writes for itself is in `~/.local/state/claude-desktop-sessi
 | `config.json` | The enrolled directories |
 | `state.json` | What each side last agreed on, and the login last seen |
 | `kept/` | Copies that were replaced or retired |
+| `backups/` | Backups taken with `--backup`, before the first sync, and before each restore |
 | `agent.log` | The unattended log |
 
 To remove the tool, run `--uninstall-agent`, then delete that directory, the clone and the symlink. The records it copied stay where they are and are ordinary app records.
@@ -157,7 +170,7 @@ Cowork sessions, scheduled tasks, the app's backlog and its archived-sessions in
 ## Risks and limits
 
 - **It depends on how the app stores things.** The layout and behaviour it relies on were checked against desktop app 2.2553.1. An app update can change them. After a major update, do a dry run and read it before you apply.
-- **It is new.** It has a test suite and its rules have been reviewed, but it has had little use outside its author's machine. Keep a backup.
+- **It is new.** It has a test suite and its rules have been reviewed, but it has had little use outside its author's machine. Take a backup with `--backup` before anything you are unsure about.
 - **Native multi-account mode.** If the app lets you switch accounts without logging out, it keeps the previous account's running sessions in memory. Copied records with the same ids confuse that. This tool is for switching by logging out and in. If you get a native account switcher, stop using it.
 - **Remote Control links** belong to the account that opened them. Archiving or deleting such a session from the other account asks the server to clean up a link that account does not own. The app ignores the refusal.
 - **A change that moves no activity**, such as a rename, can be undone by a copy that went back in time with the same activity. The replaced copy is kept and the report says where.

@@ -35,6 +35,7 @@ def render(report: RunReport, verbose: bool = False, quiet: bool = False,
     if verbose:
         shown = [o.action for o in report.done] if report.applied else report.planned
         lines += ["  %s" % _describe(action) for action in shown]
+    lines += _backup_lines(report)
     lines += _count_lines(report)
     lines += _kept_lines(report)
     lines += standing
@@ -48,10 +49,16 @@ def render(report: RunReport, verbose: bool = False, quiet: bool = False,
 
 
 def _quiet_text(report: RunReport, standing: List[str], digest: str, previous_digest: str) -> str:
-    lines = _count_lines(report) + _kept_lines(report) if report.done else []
+    lines = _backup_lines(report) + (_count_lines(report) + _kept_lines(report) if report.done else [])
     if digest != previous_digest:
         lines += standing or ["earlier problems cleared"]
     return "\n".join(lines)
+
+
+def _backup_lines(report: RunReport) -> List[str]:
+    if report.backup is None:
+        return []
+    return ["Saved backup %s before this first sync. To go back to it: --restore %s" % (report.backup, report.backup)]
 
 
 def _count_lines(report: RunReport) -> List[str]:

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from session_sync import backups
 from session_sync.applier import Applier, Outcome
 from session_sync.atomic import TEMP_PREFIX, TEMP_SUFFIX
 from session_sync.enrolment import (EnrolmentError, load_enrolled, reject_same_directory_twice,
@@ -41,6 +42,10 @@ class Settings:
         return self.state_dir / "kept"
 
     @property
+    def backups_root(self) -> Path:
+        return self.state_dir / "backups"
+
+    @property
     def lock_path(self) -> Path:
         return self.state_dir / "lock"
 
@@ -70,6 +75,7 @@ class RunReport:
     problems: List[Problem]
     unenrolled: Dict[Path, int]
     outcomes: List[Outcome] = field(default_factory=list)
+    backup: Optional[str] = None  # the backup this run took before its first write, if any
 
     @property
     def failures(self) -> List[Outcome]:
@@ -90,7 +96,7 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
     stored = _state_or_abort(settings)
     on_disk = encode_state(stored)
     if apply:
-        _sweep_stale_temps(partitions + [settings.state_dir], now_ns())
+        _sweep_stale_temps(partitions + [settings.state_dir, settings.backups_root], now_ns())
         _sweep_stale_temps(_folders_under(settings.kept_root), now_ns())
 
     scans = _scan_or_abort(partitions, stored.cache, now_ns, "Nothing was changed.")
@@ -108,6 +114,8 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
     if not apply:
         return report
 
+    if not settings.state_path.exists():
+        report.backup = _backup_before_the_first_sync(settings, partitions, now_ns)
     if _remember_what_was_seen(stored, scans):
         # Durable before the first write: a run that dies must not forget what it saw (R7).
         save_state(settings.state_path, stored)
@@ -160,6 +168,16 @@ def _remember_placements(stored: StoredState, done: List[Outcome], scans: Dict[s
         if isinstance(action, (CreateRecord, ReplaceRecord)):
             placed = scans[action.source].snapshot.records[action.session_id].state_hash
             stored.sync.placed.setdefault(action.target, {})[action.session_id] = placed
+
+
+def _backup_before_the_first_sync(settings: Settings, partitions: List[Path], now_ns: Callable[[], int]) -> str:
+    """With no sync history, copies that differ are decided by activity alone. That is the run
+    most worth being able to take back, so it does not start without a backup (R13)."""
+    try:
+        return backups.take(partitions, settings.state_path, settings.backups_root,
+                            reason="before the first sync", now_ns=now_ns).id
+    except backups.BackupFailed as failed:
+        raise RunAborted("%s The first sync does not start without a backup. Nothing was changed." % failed)
 
 
 def _save_if_worth_it(settings: Settings, stored: StoredState, on_disk: dict, clean: bool, now_ms: int) -> None:

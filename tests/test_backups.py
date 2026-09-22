@@ -6,8 +6,8 @@ import zipfile
 from unittest import mock
 
 from session_sync import backups
-from session_sync.backups import BackupFailed, BackupUnusable, RestoreRefused
-from tests.fs_helpers import LONG_AGO_S, SECOND_NS, Sandbox, X, Y, write_record, write_tombstone
+from session_sync.backups import BackupFailed, BackupUnusable, RestoreIncomplete, RestoreRefused
+from tests.fs_helpers import LONG_AGO_S, SECOND_NS, Sandbox, X, Y, title_of, write_record, write_tombstone
 
 Z = "33333333-3333-4333-8333-333333333333"
 NOW_NS = (LONG_AGO_S + 3600) * SECOND_NS
@@ -22,13 +22,16 @@ class BackupsTest(unittest.TestCase):
         self.root = self.box.state_dir / "backups"
         self.clock_s = LONG_AGO_S + 3600
 
-    def take(self, reason="asked for", note="", folders=None):
+    def take(self, reason="asked for", note="", folders=None, protected=()):
         self.clock_s += 60
         return backups.take(folders or self.folders, self.state, self.root, reason=reason, note=note,
-                            now_ns=lambda: self.clock_s * SECOND_NS)
+                            now_ns=lambda: self.clock_s * SECOND_NS, protected=protected)
 
     def contents(self, folder):
         return {p.name: (p.read_bytes(), os.lstat(p).st_mtime_ns) for p in sorted(folder.iterdir())}
+
+    def names(self, folder):
+        return sorted(p.name for p in folder.iterdir())
 
 
 class TakingABackup(BackupsTest):
@@ -95,10 +98,11 @@ class TakingABackup(BackupsTest):
         self.addCleanup(os.chmod, locked, 0o600)
 
         taken = self.take()
+        os.chmod(locked, 0o600)  # readable again by the time someone goes back to that backup
         plan = backups.plan_restore(taken.path, self.folders)
 
         self.assertEqual((taken.counts[0], taken.unreadable), ((str(self.box.a), 1, 0), 1))
-        self.assertEqual(plan.removals[str(self.box.a)], [])
+        self.assertEqual((plan.writes[str(self.box.a)], plan.removals[str(self.box.a)]), ([], []))
         self.assertEqual(backups.listing(self.root)[0].unreadable, 1)
 
     def test_a_file_that_keeps_changing_fails_the_backup_and_leaves_nothing_behind(self):
@@ -152,6 +156,42 @@ class ListingAndPruning(BackupsTest):
     def test_no_folder_yet_is_an_empty_list(self):
         self.assertEqual(backups.listing(self.root), [])
 
+    def test_a_backup_taken_after_the_clock_went_back_survives_its_own_retention(self):
+        # Retention goes by name, and a name is a time. A backup dated before ten others still exists.
+        write_record(self.box.a, X)
+        for _ in range(2):
+            self.take()
+        self.clock_s -= 3600
+
+        with mock.patch.object(backups, "KEEP", 2):
+            late = self.take()
+
+        self.assertTrue(late.path.exists())
+        self.assertEqual(len(list(self.root.iterdir())), 3)
+
+    def test_an_archive_a_restore_is_taken_from_survives_the_backup_of_the_present(self):
+        write_record(self.box.a, X)
+        oldest, second, third = (self.take() for _ in range(3))
+
+        with mock.patch.object(backups, "KEEP", 2):
+            fourth = self.take(protected=(oldest.path,))
+
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()),
+                         sorted([oldest.path.name, third.path.name, fourth.path.name]))
+        self.assertEqual(fourth.pruned, (second.path.name,))
+
+    def test_a_removal_that_failed_is_not_claimed(self):
+        write_record(self.box.a, X)
+        archives = [self.take() for _ in range(3)]
+        os.chmod(self.root, 0o500)
+        self.addCleanup(os.chmod, self.root, 0o700)
+
+        with mock.patch.object(backups, "KEEP", 1):
+            removed = backups.prune(self.root, never=(archives[-1].path,))
+
+        self.assertEqual(removed, [])
+        self.assertEqual(len(list(self.root.iterdir())), 3)
+
     def test_only_the_newest_are_kept_and_the_one_just_taken_always_is(self):
         write_record(self.box.a, X)
         taken = [self.take() for _ in range(4)]
@@ -179,6 +219,33 @@ class PlanningARestore(BackupsTest):
         self.assertEqual(plan.removals, {str(self.box.a): [marker.name], str(self.box.b): [newer.name]})
         self.assertEqual(plan.unchanged, {str(self.box.a): 0, str(self.box.b): 1})
         self.assertTrue(untouched.exists())
+
+    def test_a_file_that_cannot_be_read_now_refuses_the_restore(self):
+        # The backup a restore takes of the present would not hold it, whether the restore would
+        # write over it or remove it.
+        write_record(self.box.a, X, title="as it was")
+        taken = self.take()
+        changed = write_record(self.box.a, X, at_s=LONG_AGO_S + 9, title="unique current content")
+        extra = write_record(self.box.b, Y)
+        for locked in (changed, extra):
+            os.chmod(locked, 0)
+            self.addCleanup(os.chmod, locked, 0o600)
+
+        with self.assertRaises(RestoreRefused) as refused:
+            backups.plan_restore(taken.path, self.folders)
+
+        self.assertIn(changed.name, str(refused.exception))
+
+    def test_a_folder_that_cannot_be_listed_refuses_the_restore(self):
+        write_record(self.box.a, X)
+        taken = self.take()
+        os.chmod(self.box.b, 0)
+        self.addCleanup(os.chmod, self.box.b, 0o700)
+
+        with self.assertRaises(RestoreRefused) as refused:
+            backups.plan_restore(taken.path, self.folders)
+
+        self.assertIn(str(self.box.b), str(refused.exception))
 
     def test_a_backup_of_other_folders_is_refused(self):
         write_record(self.box.a, X)
@@ -285,6 +352,73 @@ class Restoring(BackupsTest):
         again = backups.plan_restore(taken.path, self.folders)
 
         self.assertEqual((again.writes, again.removals), ({str(self.box.a): [], str(self.box.b): []},) * 2)
+
+    def test_a_removal_that_fails_stops_the_restore_before_the_state_is_touched(self):
+        write_record(self.box.a, X)
+        self.box.state_dir.mkdir(parents=True, exist_ok=True)
+        self.state.write_text('{"the": "state then"}')
+        taken = self.take()
+        extra = write_record(self.box.a, Y)
+        self.state.write_text('{"the": "state now"}')
+        os.chmod(self.box.a, 0o500)
+        self.addCleanup(os.chmod, self.box.a, 0o700)
+
+        with self.assertRaises(RestoreIncomplete) as stopped:
+            backups.apply_restore(backups.plan_restore(taken.path, self.folders), self.state)
+
+        self.assertIn(extra.name, str(stopped.exception))
+        self.assertIn("--restore %s --apply" % taken.id, str(stopped.exception))
+        self.assertEqual(self.state.read_text(), '{"the": "state now"}')
+        os.chmod(self.box.a, 0o700)
+
+        backups.apply_restore(backups.plan_restore(taken.path, self.folders), self.state)
+
+        self.assertFalse(extra.exists())
+        self.assertEqual(self.state.read_text(), '{"the": "state then"}')
+
+    def test_a_removal_whose_file_is_already_gone_is_the_goal_state(self):
+        write_record(self.box.a, X)
+        taken = self.take()
+        extra = write_record(self.box.a, Y)
+        plan = backups.plan_restore(taken.path, self.folders)
+        extra.unlink()
+
+        backups.apply_restore(plan, self.state)
+
+        self.assertEqual(self.names(self.box.a), ["local_%s.json" % X])
+
+    def test_a_write_that_fails_stops_the_restore_and_names_the_file(self):
+        write_record(self.box.a, X, title="as it was")
+        untouched = write_record(self.box.b, Y, title="as it was")
+        taken = self.take()
+        changed = write_record(self.box.a, X, at_s=LONG_AGO_S + 9, title="renamed since")
+        write_record(self.box.b, Y, at_s=LONG_AGO_S + 9, title="renamed since")
+        os.chmod(self.box.a, 0o500)
+        self.addCleanup(os.chmod, self.box.a, 0o700)
+
+        with self.assertRaises(RestoreIncomplete) as stopped:
+            backups.apply_restore(backups.plan_restore(taken.path, self.folders), self.state)
+
+        self.assertIn(changed.name, str(stopped.exception))
+        self.assertEqual(self.names(self.box.a), [changed.name], "no staged file was left behind")
+        self.assertIn(title_of(self.box.b, Y), ("as it was", "renamed since"))
+
+    def test_a_state_that_cannot_be_written_stops_the_restore_after_the_folders(self):
+        write_record(self.box.a, X, title="as it was")
+        self.box.state_dir.mkdir(parents=True, exist_ok=True)
+        self.state.write_text('{"the": "state then"}')
+        taken = self.take()
+        write_record(self.box.a, X, at_s=LONG_AGO_S + 9, title="renamed since")
+        self.state.write_text('{"the": "state now"}')
+        os.chmod(self.box.state_dir, 0o500)
+        self.addCleanup(os.chmod, self.box.state_dir, 0o700)
+
+        with self.assertRaises(RestoreIncomplete) as stopped:
+            backups.apply_restore(backups.plan_restore(taken.path, self.folders), self.state)
+
+        self.assertIn("state.json", str(stopped.exception))
+        self.assertEqual(title_of(self.box.a, X), "as it was")
+        self.assertEqual(self.state.read_text(), '{"the": "state now"}')
 
     def test_a_member_that_changed_after_the_plan_was_made_stops_the_restore_before_the_folders_change(self):
         # Two files to write and the second one is bad: the first must not have been written either.

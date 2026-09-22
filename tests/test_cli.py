@@ -419,6 +419,90 @@ class Backups(CliTest):
 
         self.assertEqual(title_of(self.box.a, X), "renamed since")
 
+    def test_restoring_the_oldest_of_ten_keeps_it_and_the_backup_of_the_present(self):
+        oldest = self.renamed_since_a_backup()
+        for _ in range(9):
+            self.run_cli("--backup")
+        self.assertEqual(len(self.ids()), 10)
+
+        code, text = self.run_cli("--restore", oldest, "--apply")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(title_of(self.box.a, X), "as it was")
+        present = text.split("--restore ")[1].split()[0]
+        self.assertEqual(sorted(self.ids()), sorted(self.ids()))  # no duplicates
+        self.assertTrue({oldest, present} <= set(self.ids()), "both recovery archives are kept")
+        self.assertEqual(len(self.ids()), 11)
+
+    def test_a_restore_refuses_when_a_current_file_cannot_be_read_and_saves_nothing(self):
+        only = self.renamed_since_a_backup()
+        locked = self.box.a / ("local_%s.json" % X)
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o600)
+
+        dry = self.run_cli("--restore", only)
+        applied = self.run_cli("--restore", only, "--apply")
+
+        for code, text in (dry, applied):
+            self.assertEqual(code, 2)
+            self.assertIn("cannot be read", text)
+            self.assertNotIn("would write", text)
+        self.assertEqual(self.ids(), [only], "no backup of the present was taken")
+        os.chmod(locked, 0o600)
+        self.assertEqual(title_of(self.box.a, X), "renamed since")
+
+    def test_a_file_that_stops_being_readable_while_the_present_is_saved_still_stops_the_restore(self):
+        from unittest import mock
+        from session_sync import backups
+        only = self.renamed_since_a_backup()
+        locked = self.box.a / ("local_%s.json" % X)
+        real = backups.take
+
+        def it_becomes_unreadable_meanwhile(*args, **kwargs):
+            os.chmod(locked, 0)
+            self.addCleanup(os.chmod, locked, 0o600)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(backups, "take", it_becomes_unreadable_meanwhile):
+            code, text = self.run_cli("--restore", only, "--apply")
+
+        self.assertEqual(code, 2)
+        self.assertIn("could not be read", text)
+        os.chmod(locked, 0o600)
+        self.assertEqual(title_of(self.box.a, X), "renamed since")
+
+    def test_a_restore_that_cannot_finish_says_so_and_claims_nothing(self):
+        self.enrol_both()
+        write_record(self.box.a, X)
+        self.run_cli("--backup")
+        (only,) = self.ids()
+        extra = write_record(self.box.a, Y)
+        os.chmod(self.box.a, 0o500)
+        self.addCleanup(os.chmod, self.box.a, 0o700)
+
+        code, text = self.run_cli("--restore", only, "--apply")
+
+        self.assertEqual(code, 2)
+        self.assertIn(extra.name, text)
+        self.assertNotIn("removed 1", text)
+        self.assertNotIn("Went back", text)
+        self.assertTrue(extra.exists())
+        os.chmod(self.box.a, 0o700)
+
+        code, text = self.run_cli("--restore", only, "--apply")
+
+        self.assertEqual(code, 0)
+        self.assertIn("removed 1", text)
+        self.assertFalse(extra.exists())
+
+    def test_a_refused_restore_prints_no_counts(self):
+        only = self.renamed_since_a_backup()
+        self.running = True
+
+        _, text = self.run_cli("--restore", only, "--apply")
+
+        self.assertNotIn("wrote", text)
+
     def test_an_unknown_backup_is_refused_with_a_pointer_to_the_list(self):
         self.enrol_both()
 

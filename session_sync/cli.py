@@ -88,7 +88,7 @@ def main(argv: List[str], env: Optional[Environment] = None) -> int:
             return 0
         return _run(args, env, say)
     except (RunAborted, EnrolmentError, agent.AgentError, StateUnusable, SyncBusy, backups.BackupFailed,
-            backups.BackupUnusable, backups.RestoreRefused) as error:
+            backups.BackupUnusable, backups.RestoreRefused, backups.RestoreIncomplete) as error:
         _say_abort(str(error), args.quiet, env, say)
         return 2
 
@@ -326,12 +326,8 @@ def _restore(backup_id: str, apply: bool, env: Environment, say) -> int:
         if not chosen.usable:
             raise backups.BackupUnusable("Backup %s %s. Nothing was changed." % (chosen.id, chosen.reason))
         plan = backups.plan_restore(chosen.path, partitions)
-        word = "wrote" if apply else "would write"
-        for partition in (str(path) for path in partitions):
-            say("%s  %s %d, %s %d, %d already as they were" % (
-                label(Path(partition)), word, len(plan.writes[partition]),
-                "removed" if apply else "would remove", len(plan.removals[partition]), plan.unchanged[partition]))
         if not apply:
+            _say_restore_counts(plan, partitions, done=False, say=say)
             say("The sync history %s." % ("would be put back as it was" if plan.restores_state
                                           else "would be set aside: this backup predates it"))
             say("Dry run. Pass --apply to restore.%s" % (
@@ -339,15 +335,31 @@ def _restore(backup_id: str, apply: bool, env: Environment, say) -> int:
             return 0
         _refuse_beside_the_app(env)
         present = backups.take(partitions, env.settings.state_path, env.settings.backups_root,
-                               reason="before restoring %s" % chosen.id, now_ns=env.now_ns)
+                               reason="before restoring %s" % chosen.id, now_ns=env.now_ns,
+                               protected=(chosen.path,))
+        if present.unreadable:
+            # The plan refused what could not be read a moment ago; this is what the backup holds.
+            raise backups.RestoreRefused(
+                "%d files could not be read while the present was being saved, so backup %s does not hold "
+                "them. Fix their permissions and run this again. Nothing was changed."
+                % (present.unreadable, present.id))
         _refuse_beside_the_app(env)  # taking that backup took a moment
         backups.apply_restore(plan, env.settings.state_path, now_ns=env.now_ns)
+    _say_restore_counts(plan, partitions, done=True, say=say)  # only once the whole restore went through
     say("The sync history was %s." % ("put back as it was" if plan.restores_state
                                       else "set aside: this backup predates it"))
     say("Went back to backup %s. Reopen the Claude desktop app.\n"
         "The state before this restore was saved first. To undo the restore: --restore %s --apply"
         % (chosen.id, present.id))
     return 0
+
+
+def _say_restore_counts(plan: backups.RestorePlan, partitions: List[Path], done: bool, say) -> None:
+    wrote, removed = ("wrote", "removed") if done else ("would write", "would remove")
+    for partition in (str(path) for path in partitions):
+        say("%s  %s %d, %s %d, %d already as they were" % (
+            label(Path(partition)), wrote, len(plan.writes[partition]),
+            removed, len(plan.removals[partition]), plan.unchanged[partition]))
 
 
 def _refuse_beside_the_app(env: Environment) -> None:

@@ -92,7 +92,7 @@ Make sure `~/.local/bin` is on your `PATH`. The command is `claude-desktop-sessi
    claude-desktop-session-sync --apply
    ```
 
-   The first run saves a backup of the enrolled directories before it writes anything, and prints its name. If you logged in less than two minutes ago, it creates missing records and defers replacing any; run it again after that.
+   The first run saves a backup of the enrolled directories before it writes anything, and prints its name. If you logged in less than two minutes ago, or the app's log no longer holds the line for your login (it rotates every few days), it creates missing records and defers replacing any; run it again two minutes later.
 
 5. Make the app read the result. The app reads a login's directory only when that login initialises, so quit and reopen the app, or log out and in.
 

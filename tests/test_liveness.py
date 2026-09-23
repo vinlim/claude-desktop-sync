@@ -3,6 +3,7 @@ import re
 import subprocess
 import time
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 from session_sync.liveness import APP_BINARY, app_running, is_live, last_known_account, login_dated_by_app, observe_logins
@@ -19,7 +20,7 @@ HELPERS = ("/Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer
 
 
 def ps_lists(*paths, code=0):
-    return lambda *args, **kwargs: SimpleNamespace(returncode=code, stdout="\n".join(paths) + "\n")
+    return lambda *args, **kwargs: SimpleNamespace(returncode=code, stdout=("\n".join(paths) + "\n").encode())
 
 
 def ps_raises(error):
@@ -50,8 +51,19 @@ class AppRunning(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 self.assertTrue(app_running(run=ps_raises(error)))
 
-    def test_the_real_ps_accepts_the_flags(self):
-        self.assertEqual(subprocess.run(["ps", "-axo", "comm="], capture_output=True).returncode, 0)
+    def test_the_real_ps_accepts_the_flags_and_lists_this_processs_ancestors(self):
+        # pgrep leaves its own ancestors out. A run started from a shell inside the app missed
+        # the app that way. ps has no such rule, so it must list the parent of this test.
+        listed = subprocess.run(["ps", "-axo", "comm="], capture_output=True, text=True)
+        parent = subprocess.run(["ps", "-o", "comm=", "-p", str(os.getppid())], capture_output=True, text=True).stdout.strip()
+
+        self.assertEqual(listed.returncode, 0)
+        self.assertIn(parent, [line.strip() for line in listed.stdout.splitlines()])
+
+    def test_a_process_name_that_is_not_utf8_does_not_stop_the_check(self):
+        run = lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"/bin/\xff\xfe\n" + MAIN.encode() + b"\n")
+
+        self.assertTrue(app_running(run=run))
 
     def test_the_pattern_names_the_main_binary_only(self):
         self.assertIsNotNone(APP_BINARY.search(MAIN))
@@ -149,7 +161,7 @@ class ObservingTheLogin(unittest.TestCase):
         self.addCleanup(self.box.cleanup)
         self.root = str(self.box.root)
 
-    def test_the_first_sighting_and_every_change_are_dated_now(self):
+    def test_the_first_sighting_and_every_change_are_dated_now_without_the_log(self):
         logins = {}
         self.box.logged_in_as(ACCOUNT_A)
         observe_logins([self.box.a, self.box.b], logins, now_ms=1000)
@@ -196,7 +208,10 @@ class ObservingTheLogin(unittest.TestCase):
             "only a logout": [logout(NOW_S - 3600, ACCOUNT_A)],
             "no login line": ["2026-09-24 00:00:00 [info] something else"],
             "empty": [],
-            "garbled stamp": ["garbage [info] [account] Login-state transition (loggedOut: true \u2192 false, uuid: x \u2192 %s), clearing" % ACCOUNT_B],
+            "impossible date": [login(NOW_S - 3600, ACCOUNT_A, ACCOUNT_B).replace(
+                time.strftime("%Y-%m-%d", time.localtime(NOW_S - 3600)), "2026-02-30")],
+            "an older line names this login, the last one names another":
+                [login(NOW_S - 7200, ACCOUNT_A, ACCOUNT_B), login(NOW_S - 3600, ACCOUNT_B, ACCOUNT_A)],
         }
         for name, lines in cases.items():
             with self.subTest(case=name):
@@ -213,6 +228,18 @@ class ObservingTheLogin(unittest.TestCase):
             observe_logins([self.box.a], logins, now_ms=NOW_MS, app_log=None)
             self.assertEqual(logins, {self.root: (ACCOUNT_B, NOW_MS)})
 
+    def test_a_newer_login_to_the_same_account_moves_its_date_forward(self):
+        # B, then A, then B again, with no run in between: the tool sees B both times. The log
+        # shows the second login, so the grace applies to the partition just left.
+        logins = {self.root: (ACCOUNT_B, NOW_MS - 10_000_000)}
+        self.box.logged_in_as(ACCOUNT_B)
+
+        observe_logins([self.box.a], logins, now_ms=NOW_MS, app_log=self.app_log(login(NOW_S - 60, ACCOUNT_A, ACCOUNT_B)))
+        self.assertEqual(logins, {self.root: (ACCOUNT_B, (NOW_S - 60) * 1000)})
+
+        observe_logins([self.box.a], logins, now_ms=NOW_MS, app_log=self.app_log(login(NOW_S - 20_000, ACCOUNT_A, ACCOUNT_B)))
+        self.assertEqual(logins, {self.root: (ACCOUNT_B, (NOW_S - 60) * 1000)}, "an older line never moves it back")
+
     def test_a_login_the_log_dates_in_the_future_is_dated_now(self):
         logins = {}
         self.box.logged_in_as(ACCOUNT_B)
@@ -221,14 +248,19 @@ class ObservingTheLogin(unittest.TestCase):
 
         self.assertEqual(logins, {self.root: (ACCOUNT_B, NOW_MS)})
 
-    def test_only_the_end_of_a_large_log_is_read(self):
-        # The log runs to megabytes; the login line is near the end.
+    def test_a_login_line_anywhere_in_the_current_log_is_found(self):
+        # The app logs about 160 KB an hour and rotates at about 10 MB, so the whole current
+        # file is read: a switch in the morning must still be dated by a run in the evening.
+        from session_sync import liveness
         self.box.logged_in_as(ACCOUNT_B)
         filler = ["2026-09-24 00:00:00 [info] filler " + "x" * 200] * 6000
-        log = self.app_log(*filler, login(NOW_S - 3600, ACCOUNT_A, ACCOUNT_B))
+        log = self.app_log(login(NOW_S - 3600, ACCOUNT_A, ACCOUNT_B), *filler)
         self.assertGreater(log.stat().st_size, 1_000_000)
 
         self.assertEqual(login_dated_by_app(log, ACCOUNT_B, NOW_MS), (NOW_S - 3600) * 1000)
+        self.assertGreater(liveness.APP_LOG_TAIL, 10 * 1024 * 1024)
+        with mock.patch.object(liveness, "APP_LOG_TAIL", 4096):
+            self.assertIsNone(login_dated_by_app(log, ACCOUNT_B, NOW_MS), "past the cap it is not read")
 
     def app_log(self, *lines):
         path = self.box.base / "Logs" / "main.log"

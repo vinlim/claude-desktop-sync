@@ -7,15 +7,15 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# The main binary only, matched against executable paths. Helper processes live under
-# Contents/Frameworks. Executable paths, because pgrep cannot read the main process's
-# arguments after some relaunches, and a miss there read as "not running".
+# The main binary only, matched against executable paths from ps. Helper processes live under
+# Contents/Frameworks. Not pgrep: it leaves its own ancestors out, so a run started from a
+# shell inside the app never saw the app, and that miss read as "not running".
 APP_BINARY = re.compile(r"Claude\.app/Contents/MacOS/Claude$")
 PS_TIMEOUT_S = 5
 
 # The app writes a line for every login change. It dates a change the tool did not see happen.
 APP_LOG = Path.home() / "Library" / "Logs" / "Claude" / "main.log"
-APP_LOG_TAIL = 512 * 1024
+APP_LOG_TAIL = 16 * 1024 * 1024  # the app rotates the log at about 10 MB, so this is the whole current file
 # A logout line ends in "uuid: X \u2192 <none>", so the uuid alone tells the two apart.
 LOGIN_LINE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) .*Login-state transition \(loggedOut: [^,]+, "
                         r"uuid: \S+ \u2192 ([0-9A-Fa-f-]{36})\)")
@@ -24,18 +24,19 @@ LOGIN_LINE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) .*Login-state transi
 # (DESIGN.md F9), so for a while after a login change no partition is safe to change.
 SWITCH_GRACE_MS = 120_000
 
-Logins = Dict[str, Tuple[str, int]]  # app data root -> (login last seen there, when the tool first saw it)
+Logins = Dict[str, Tuple[str, int]]  # app data root -> (login last seen there, when it changed, in ms)
 
 
 def app_running(run=subprocess.run) -> bool:
     """Reads the process list by executable path. A listing that fails is read as running."""
     try:
-        listed = run(["ps", "-axo", "comm="], capture_output=True, text=True, timeout=PS_TIMEOUT_S)
+        listed = run(["ps", "-axo", "comm="], capture_output=True, timeout=PS_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return True
     if listed.returncode != 0:
         return True
-    return any(APP_BINARY.search(line.strip()) for line in listed.stdout.splitlines())
+    names = listed.stdout.decode("utf-8", errors="replace")  # a process may be named in any bytes
+    return any(APP_BINARY.search(line.strip()) for line in names.splitlines())
 
 
 def last_known_account(root: Path) -> Optional[str]:
@@ -53,14 +54,21 @@ def root_of(partition: Path) -> Path:
 
 
 def observe_logins(partitions: List[Path], logins: Logins, now_ms: int, app_log: Optional[Path] = None) -> None:
-    """Dates a login change when it is first seen: by the app's own log where that names the
-    login, else by now. The app's config file cannot date it, because the app rewrites that
-    file about once a minute for unrelated reasons."""
+    """Dates a login change: by the app's own log where its last login line names the login,
+    else by the moment the tool first sees the change. A newer login to the same account in
+    the log moves the date forward, so a round trip that ended where it began still gets its
+    grace. The app's config file cannot date a change, because the app rewrites that file
+    about once a minute for unrelated reasons."""
     for root in {root_of(partition) for partition in partitions}:
         account = last_known_account(root)
-        if account is not None and logins.get(str(root), (None, 0))[0] != account:
-            dated = login_dated_by_app(app_log, account, now_ms) if app_log is not None else None
+        if account is None:
+            continue
+        dated = login_dated_by_app(app_log, account, now_ms) if app_log is not None else None
+        known = logins.get(str(root))
+        if known is None or known[0] != account:
             logins[str(root)] = (account, now_ms if dated is None else dated)
+        elif dated is not None and dated > known[1]:
+            logins[str(root)] = (account, dated)
 
 
 def login_dated_by_app(app_log: Path, account: str, now_ms: int) -> Optional[int]:

@@ -560,6 +560,28 @@ class LoginChanges(RunTest):
         self.sync()
         self.assertEqual(title_of(self.box.a, X), "newer")
 
+    def test_a_delete_made_after_a_switch_the_tool_never_saw_still_travels_when_the_app_dates_the_switch(self):
+        # Switch to A (no run), delete X under A, run once, log out: the delete has to be in B
+        # by then. The app's log dates the switch, so the grace does not start at this run.
+        import time as clock
+        write_record(self.box.a, X)
+        write_record(self.box.b, X)
+        self.app_running_as(ACCOUNT_B)
+        self.assertEqual(self.sync().problems, [])
+        self.box.logged_in_as(ACCOUNT_A)  # two hours ago, with no run since
+        log = self.box.base / "Logs" / "main.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("%s [info] [account] Login-state transition (loggedOut: true \u2192 false, uuid: %s \u2192 %s), clearing oauth cache\n"
+                       % (clock.strftime("%Y-%m-%d %H:%M:%S", clock.localtime(self.clock_s - 7200)), ACCOUNT_B, ACCOUNT_A), encoding="utf-8")
+        self.settings = Settings(state_dir=self.box.state_dir, app_log=log)
+        (self.box.a / ("local_%s.json" % X)).unlink()
+        write_tombstone(self.box.a, X, deleted_at_ms=self.clock_s * 1000, at_s=self.clock_s)
+
+        report = self.sync()
+
+        self.assertEqual(report.problems, [])
+        self.assertEqual(self.names(self.box.b), ["deleted_%s" % X])
+
     def test_a_dry_run_sees_a_login_change_without_recording_it(self):
         write_record(self.box.a, X)
         self.sync()

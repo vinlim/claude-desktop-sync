@@ -28,6 +28,7 @@ HEARTBEAT_S = 300  # how stale "last clean run" may get before an otherwise idle
 @dataclass(frozen=True)
 class Settings:
     state_dir: Path
+    app_log: Optional[Path] = None  # the desktop app's own log, which dates a login change
 
     @property
     def config_path(self) -> Path:
@@ -101,7 +102,7 @@ def sync(settings: Settings, apply: bool, prefer: Optional[str] = None, prefer_s
 
     scans = _scan_or_abort(partitions, stored.cache, now_ns, "Nothing was changed.")
     app_is_running = running()
-    observe_logins(partitions, stored.logins, now_ns() // 1_000_000)
+    observe_logins(partitions, stored.logins, now_ns() // 1_000_000, app_log=settings.app_log)
     live = {str(p) for p in partitions if is_live(p, app_is_running, now_ns() // 1_000_000, stored.logins)}
     the_plan = plan([scan.snapshot for scan in scans.values()], stored.sync, live,
                     _resolve_prefer(prefer, partitions), prefer_session)

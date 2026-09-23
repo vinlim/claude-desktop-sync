@@ -13,7 +13,7 @@ from typing import Callable, List, Optional, TextIO
 
 from session_sync import agent, backups
 from session_sync.enrolment import EnrolmentError, SESSIONS_DIR, enrol, load_enrolled, unenrol, unenrolled_with_records
-from session_sync.liveness import app_running
+from session_sync.liveness import APP_LOG, app_running
 from session_sync.report import render
 from session_sync.run import RunAborted, Settings, forget_presence, label, remember_reported, sync
 from session_sync.state_store import StateUnusable, load_state
@@ -36,7 +36,7 @@ class SyncBusy(Exception):
 
 @dataclass
 class Environment:
-    settings: Settings = field(default_factory=lambda: Settings(state_dir=DEFAULT_STATE_DIR))
+    settings: Settings = field(default_factory=lambda: Settings(state_dir=DEFAULT_STATE_DIR, app_log=APP_LOG))
     out: TextIO = sys.stdout
     now_ns: Callable[[], int] = time.time_ns
     running: Callable[[], bool] = app_running

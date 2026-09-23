@@ -33,7 +33,7 @@ The decisions do not use file times. The app rewrites a record whenever you clic
 
 Nothing unique is destroyed. A replaced copy is kept unless it is strictly superseded, and a retired record is always kept, under `~/.local/state/claude-desktop-session-sync/kept/`. The report names the path.
 
-The tool stays out of the running app's way. The app holds the current login's sessions in memory and rewrites them from memory, so in that directory the tool only adds files that are missing and never replaces or removes one. For two minutes after it first sees a login change it treats every directory that way, because the app records the new login before it has finished saving the old one. Each guard is checked again immediately before the write.
+The tool stays out of the running app's way. The app holds the current login's sessions in memory and rewrites them from memory, so in that directory the tool only adds files that are missing and never replaces or removes one. For two minutes after a login change it treats every directory that way, because the app records the new login before it has finished saving the old one. It reads the time of the change from the app's own log, so a run hours after the switch does not wait. Each guard is checked again immediately before the write.
 
 The full contract, with the facts about the app it relies on and where each was verified, is in [DESIGN.md](DESIGN.md).
 
@@ -92,7 +92,7 @@ Make sure `~/.local/bin` is on your `PATH`. The command is `claude-desktop-sessi
    claude-desktop-session-sync --apply
    ```
 
-   The first run saves a backup of the enrolled directories before it writes anything, and prints its name. It also dates your login as just changed, so it creates missing records and defers replacing any. Run it again two minutes later.
+   The first run saves a backup of the enrolled directories before it writes anything, and prints its name. If you logged in less than two minutes ago, or the app's log no longer holds the line for your login (it rotates every few days), it creates missing records and defers replacing any; run it again two minutes later.
 
 5. Make the app read the result. The app reads a login's directory only when that login initialises, so quit and reopen the app, or log out and in.
 

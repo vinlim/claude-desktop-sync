@@ -44,6 +44,13 @@ class CliTest(unittest.TestCase):
         self.assertEqual(self.run_cli("--enroll", str(self.box.a), "--enroll", str(self.box.b))[0], 0)
 
 
+class Defaults(unittest.TestCase):
+    def test_the_real_tool_reads_the_apps_log_to_date_a_login_change(self):
+        from session_sync.liveness import APP_LOG
+        self.assertEqual(Environment().settings.app_log, APP_LOG)
+        self.assertEqual(APP_LOG.name, "main.log")
+
+
 class Enrolling(CliTest):
     def test_list_shows_what_is_enrolled_and_what_could_be(self):
         write_record(self.box.b, X)

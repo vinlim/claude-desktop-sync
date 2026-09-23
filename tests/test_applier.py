@@ -223,7 +223,7 @@ class GuardTiming(ApplierTest):
         self.assertEqual(self.names(self.box.b), ["local_%s.json" % X])
 
     def test_being_stopped_in_the_middle_of_the_last_guard_leaves_no_staged_file(self):
-        # The guard runs pgrep, so a SIGTERM from launchd can land right there.
+        # The guard reads the process list, so a SIGTERM from launchd can land right there.
         write_record(self.box.a, X, title="new")
         write_record(self.box.b, X, title="old")
         scans = {str(p): scan_partition(p, {}, clock=lambda: NOW_NS) for p in (self.box.a, self.box.b)}

@@ -9,8 +9,9 @@ from session_sync.model import Action, Problem
 from session_sync.run import RunReport, label
 
 EXPLANATIONS = {
-    "live": "waiting: the running app may still hold this partition (it is the current login, or the login "
-            "changed in the last two minutes). A later run syncs it",
+    "live": "waiting: the running app may still hold this partition (it is the current login, the login changed "
+            "in the last two minutes, or the app's log did not date the change and the tool first saw it less than "
+            "two minutes ago). A later run syncs it",
     "tied": "both copies changed with no new activity on either. Choose one with --prefer PARTITION",
     "lost": "was here before and is gone without a delete marker, so it is not recreated here. "
             "--recreate ID lifts that",

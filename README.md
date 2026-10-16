@@ -96,6 +96,8 @@ Make sure `~/.local/bin` is on your `PATH`. The command is `claude-desktop-sessi
 
 5. Make the app read the result. The app reads a login's directory only when that login initialises, so quit and reopen the app, or log out and in.
 
+6. The first time you open each account after a sync, set how its sidebar groups sessions. Each account keeps its own grouping, and this tool cannot copy it; see [What it does not sync](#what-it-does-not-sync).
+
 From then on, run `claude-desktop-session-sync --apply` before you switch accounts. Or install the agent, which runs whenever an enrolled directory changes:
 
 ```bash
@@ -166,6 +168,10 @@ To remove the tool, run `--uninstall-agent`, then delete that directory, the clo
 ## What it does not sync
 
 Cowork sessions, scheduled tasks, the app's backlog and its archived-sessions index are left alone. Transcripts are shared already.
+
+The sidebar's view settings are not on disk to copy. The grouping, the sort order, the recents filters and custom groups are saved per account on Anthropic's servers. On every login change the app clears its local copy and loads the new account's. An account that never chose a grouping shows every session under "This computer", newest first, with "Show more" at the end. The synced sessions are all there, arranged differently.
+
+Set the view once under each account. To match an account that groups by project, log in to the other account and choose Project as its grouping; the app saves that choice with the account. Each account also has its own list of project folders. If a folder's group is missing under one account, add that folder there.
 
 ## Risks and limits
 
